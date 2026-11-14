@@ -37,6 +37,7 @@ class ChatRequest:
     max_tokens: int
     seed: int | None = None
     top_logprobs: int | None = None  # if set, ask for logprobs of generated tokens
+    reasoning_effort: str | None = None  # reasoning models only (e.g. Gemini, gpt-oss); None = omit
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -50,6 +51,8 @@ class ChatRequest:
         if self.top_logprobs is not None:
             payload["logprobs"] = True
             payload["top_logprobs"] = self.top_logprobs
+        if self.reasoning_effort is not None:
+            payload["reasoning_effort"] = self.reasoning_effort
         return payload
 
 

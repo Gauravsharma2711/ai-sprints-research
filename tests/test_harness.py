@@ -470,7 +470,7 @@ def test_judge_sees_only_question_and_stripped_prose(tmp_path: Path) -> None:
                   if r["event"] == "call" and r["role"] == "judge" and r["purpose"] == "primary"]
     assert judge_reqs
     for req in judge_reqs:
-        assert set(req) == {"model", "messages", "temperature", "max_tokens"}
+        assert set(req) <= {"model", "messages", "temperature", "max_tokens", "reasoning_effort"}  # nothing identifying
         assert req["temperature"] == 0.0
         briefing = req["messages"][1]["content"].split("<<<")[1].split(">>>")[0]
         assert "PROBABILITY_YES" not in briefing and "EVIDENCE_TIER" not in briefing
@@ -501,6 +501,70 @@ def test_estimate_refuses_over_cap_and_passes_under(tmp_path: Path) -> None:
     prices = {"price_per_1m_input_usd": 1.0, "price_per_1m_output_usd": 2.0}
     assert main(["--config", str(write_config(tmp_path, judge=prices, cap=0.0)), "--estimate"]) == 2
     assert main(["--config", str(write_config(tmp_path, judge=prices, cap=1000.0)), "--estimate"]) == 0
+
+
+# ---------------------------------------------------------------------------
+# --skip-judge and --judge-only
+# ---------------------------------------------------------------------------
+
+
+def _judge_requests(tmp_path: Path) -> list[dict[str, Any]]:
+    return [r["request"] for r in log_records(tmp_path) if r["event"] == "call" and r["role"] == "judge"]
+
+
+def test_skip_judge_makes_no_judge_calls_and_marks_pending(tmp_path: Path) -> None:
+    assert dry(tmp_path, Factory(**NO_FAILURES), "--skip-judge") == 0
+    out = rows(tmp_path)
+    assert all(r["status_judge"] == "pending" and r["J"] == "nan" for r in out)
+    assert all(r["status_T1"] == "ok" for r in out)
+    assert _judge_requests(tmp_path) == []
+
+
+def test_judge_only_fills_pending_cells_then_is_a_no_op(tmp_path: Path) -> None:
+    cfg = write_config(tmp_path)
+    assert dry(tmp_path, Factory(**NO_FAILURES), "--skip-judge", cfg=cfg) == 0
+    first = Factory(**NO_FAILURES)
+    assert main(["--config", str(cfg), "--dry-run", "--judge-only"], mock_factory=first) == 0
+    out = rows(tmp_path)
+    assert first.calls == 2 and all(r["status_judge"] == "ok" and r["J"] != "nan" for r in out)
+    assert all(r["status_T1"] == "ok" for r in out)          # other columns untouched
+    again = Factory(**NO_FAILURES)
+    assert main(["--config", str(cfg), "--dry-run", "--judge-only"], mock_factory=again) == 0
+    assert again.calls == 0
+
+
+def test_judge_only_rejudges_cells_scored_by_another_model(tmp_path: Path) -> None:
+    assert dry(tmp_path, Factory(**NO_FAILURES), cfg=write_config(tmp_path, judge={"model": "model-a"})) == 0
+    assert {q["model"] for q in _judge_requests(tmp_path)} == {"model-a"}
+    cfg_b = write_config(tmp_path, judge={"model": "model-b"})
+    f = Factory(**NO_FAILURES)
+    assert main(["--config", str(cfg_b), "--dry-run", "--judge-only"], mock_factory=f) == 0
+    assert f.calls == 2
+    assert [q["model"] for q in _judge_requests(tmp_path)][-2:] == ["model-b", "model-b"]
+    same = Factory(**NO_FAILURES)
+    assert main(["--config", str(cfg_b), "--dry-run", "--judge-only"], mock_factory=same) == 0
+    assert same.calls == 0
+
+
+def test_judge_only_stops_at_daily_cap_and_resumes(tmp_path: Path) -> None:
+    capped = write_config(tmp_path, judge={"rate_limits": {"requests_per_day": 1}})
+    assert dry(tmp_path, Factory(**NO_FAILURES), "--skip-judge", cfg=capped) == 0
+    assert main(["--config", str(capped), "--dry-run", "--judge-only"], mock_factory=Factory(**NO_FAILURES)) == 3
+    assert sum(r["status_judge"] == "pending" for r in rows(tmp_path)) >= 1      # saved, not lost
+    uncapped = write_config(tmp_path)
+    assert main(["--config", str(uncapped), "--dry-run", "--judge-only"], mock_factory=Factory(**NO_FAILURES)) == 0
+    assert all(r["status_judge"] == "ok" for r in rows(tmp_path))
+
+
+def test_reasoning_effort_is_sent_to_the_judge(tmp_path: Path) -> None:
+    assert dry(tmp_path, Factory(**NO_FAILURES), cfg=write_config(tmp_path, judge={"reasoning_effort": "low"})) == 0
+    assert {q.get("reasoning_effort") for q in _judge_requests(tmp_path)} == {"low"}
+
+
+def test_skip_judge_estimate_needs_no_judge_prices(tmp_path: Path) -> None:
+    cfg = str(write_config(tmp_path))      # judge prices are null in the repo config
+    assert main(["--config", cfg, "--estimate", "--limit", "1"]) == 2
+    assert main(["--config", cfg, "--estimate", "--limit", "1", "--skip-judge"]) == 0
 
 
 def test_spend_logged_in_out_dir_counts_toward_cap(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

@@ -871,6 +871,10 @@ def run_metrics(df: pd.DataFrame, s: Settings, paths: Paths) -> list[Path]:
     subjects = sorted(df["subject"].unique())
     print(f"  {len(df)} cells, {df['item_id'].nunique()} items, {len(subjects)} models, "
           f"conditions {conditions}; bootstrap {s.n_boot} resamples over items, seed {s.seed}")
+    unjudged = int((df["status_judge"].astype(str) == "pending").sum())
+    if unjudged:
+        print(f"  WARNING: {unjudged} cells are still pending the judge (J missing); run "
+              "`python -m src.harness --judge-only` before reporting prose-gap metrics")
 
     metrics = compute_metrics(d, s)
     contrasts = compute_contrasts(d, s)

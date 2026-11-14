@@ -51,21 +51,25 @@ subjects:
 # ---------------------------------------------------------------------------
 # Judges (must be a different family from every subject; enforced in code)
 # ---------------------------------------------------------------------------
+# Primary judge: Google Gemini via its OpenAI-compatible endpoint (decided 14 Nov 2026; replaces the
+# playbook's xAI Grok). Every J must come from this one model: `--judge-only` re-judges any cell scored
+# by a different model. Free tier: Google may use prompts/outputs to improve products and humans may
+# review them (state this in the paper's ethics appendix).
 judge:
-  provider: xai
-  family: grok
-  base_url: https://api.x.ai/v1
-  api_key_env: XAI_API_KEY
-  model: null                  # FILL IN from the xAI console before running
+  provider: gemini
+  family: google               # must differ from every subject family (checked in code)
+  base_url: https://generativelanguage.googleapis.com/v1beta/openai/
+  api_key_env: GEMINI_API_KEY
+  model: null                  # FILL IN: model id exactly as AI Studio lists it
   temperature: 0.0
-  max_tokens: 20
-  price_per_1m_input_usd: null # FILL IN from the xAI console; spend cap cannot be enforced without it
+  max_tokens: 300              # room for hidden reasoning; some Gemini models cannot turn it off
+  reasoning_effort: low        # Gemini OpenAI-compat accepts minimal|low|medium|high; null = omit
+  price_per_1m_input_usd: null # FILL IN: 0.0 on the free tier, else the paid price
   price_per_1m_output_usd: null
-  # Self-imposed caps (null = no cap). Per-minute caps make the harness wait; per-day caps stop the
-  # run (resume later). HTTP 429 responses are also retried, honouring Retry-After.
-  # Set these at or below the limits shown in the xAI console.
+  # Self-imposed caps (null = no cap), set a little under the limits AI Studio shows for the model.
+  # Per-minute caps make the harness wait; per-day caps stop the run cleanly (resume later).
   rate_limits:
-    requests_per_minute: 30
+    requests_per_minute: null
     tokens_per_minute: null
     requests_per_day: null
     tokens_per_day: null

@@ -7,27 +7,26 @@ token is needed.
 
 | Name | What |
 |---|---|
-| `HF_TOKEN` | Hugging Face token (accept the Llama 3.1 licence on HF first) |
-| `GROQ_API_KEY` | Groq key: the judge (and later the second judge) |
-| `XAI_API_KEY` | only if `JUDGE_PROVIDER = "xai"` |
+| `HF_TOKEN` | Hugging Face token, type Read (accept the Llama 3.1 licence on HF first) |
+| `GEMINI_API_KEY` | Gemini API key from Google AI Studio: the judge |
+| `GROQ_API_KEY` | optional: only for the second judge later |
 
-**Before the first session, check the judge block in Cell 1.** It is set for Groq with
-`openai/gpt-oss-120b` (the setup that passed Cell 7). Fill in `PRICE_IN_1M` / `PRICE_OUT_1M` from
-the Groq console (0.0 only if your Groq account is on the free tier with no billing), and
-`JUDGE_REQUESTS_PER_DAY` from Groq's rate-limit page. To use xAI instead, set
-`JUDGE_PROVIDER = "xai"` and the xAI model, family and prices. Everything else is already set for the first model,
-`llama-3.1-8b`. For the other models, change only the `MODEL` line in Cell 1 (table at the end).
+**How judging works now.** The GPU run (Cell 10) does every subject arm and saves the judge arm as
+`pending`. A separate judge pass (Cell 11) then scores every pending cell with Gemini. It needs no
+GPU, paces itself under Gemini's limits, stops cleanly at the daily limit, and can be resumed later
+on Kaggle or on your own computer. It also re-judges any cell that was scored by a different judge
+model (e.g. earlier gpt-oss scores), so every J comes from the same judge.
 
-Paste the cells in order.
+**Before the first session, fill in the judge block in Cell 1** from Google AI Studio:
+`JUDGE_MODEL` (exact model id), the two prices (0.0 if you use the free tier), and the three rate
+limits shown for that model. Everything else is already set. For other subject models, change only
+the `MODEL` line (table at the end).
 
 **What has been verified (14 Nov 2026, locally):** every cell ran in a real IPython kernel via
 `tools/kaggle_sim/run_sim.py`, with stand-ins for what only Kaggle has (stub Kaggle secrets and torch,
-a fake OpenAI-compatible server in place of vLLM and xAI). Passed: anonymous clone of the public
-repo, config edits, smoke test, history viewer, full 540-cell run through the real OpenAI client,
-packaging, restoring the zip in a new session (0 cells redone), and switching to a second model.
-**Not verifiable off Kaggle:** the vLLM install (Cell 5), the real GPU server and model, CUDA
-versions, real xAI responses. The first Kaggle session is the test of those. If a cell
-errors, paste the error and the last 30 lines of `/kaggle/working/vllm_server.log` to Claude.
+a fake OpenAI-compatible server in place of vLLM and Gemini). **Not verifiable off Kaggle:** the vLLM
+install (Cell 5), the real GPU server and model, CUDA versions, real Gemini responses and limits.
+If a cell errors, paste the error and the last 30 lines of `/kaggle/working/vllm_server.log` to Claude.
 
 ---
 
@@ -38,18 +37,23 @@ import time, os, sys
 START = time.time()
 
 # ---- the only lines you normally edit ----
-MODEL = "llama-3.1-8b"        # llama-3.1-8b | qwen2.5-7b | mistral-7b | phi-3.5-mini
-JUDGE_PROVIDER = "groq"       # "groq" or "xai"
-JUDGE_MODEL  = "openai/gpt-oss-120b"   # exactly as the provider lists it
-JUDGE_FAMILY = "openai"       # must differ from llama/qwen/mistral/phi (the harness checks)
-JUDGE_MAX_TOKENS = 300        # reasoning models need room to think (gpt-oss used ~80); 20 for non-reasoning
-PRICE_IN_1M  = None           # FILL IN: USD per 1M input tokens (provider console; 0.0 only if free)
-PRICE_OUT_1M = None           # FILL IN: USD per 1M output tokens
-JUDGE_REQUESTS_PER_DAY = None # FILL IN for Groq free tier (its daily request limit); None = no cap
+MODEL = "qwen2.5-7b"          # llama-3.1-8b | qwen2.5-7b | mistral-7b | phi-3.5-mini
 LIMIT = 3                     # smoke-test items
 ALLOW_UNVERIFIED = True       # set False once both annotators have reviewed the benchmark
 VLLM_SPEC = "vllm"            # if the vLLM install fails once, change to "vllm==0.9.2"
 PREV_DIR = "/kaggle/input/prev-results"   # earlier results_*.zip, uploaded as a dataset named prev-results
+
+# Judge (Google Gemini). Values from Google AI Studio for the model you pick.
+JUDGE_PROVIDER = "gemini"     # "gemini" (default) | "groq" | "xai"
+JUDGE_MODEL  = ""             # FILL IN: model id exactly as listed (Cell 7b prints the ids your key can use)
+JUDGE_FAMILY = "google"       # must differ from llama/qwen/mistral/phi (the harness checks)
+JUDGE_MAX_TOKENS = 300        # room for hidden reasoning; some Gemini models cannot turn it off
+JUDGE_REASONING_EFFORT = "low"   # Gemini accepts minimal|low|medium|high; None = do not send
+PRICE_IN_1M  = None           # FILL IN: USD per 1M input tokens; 0.0 on the free tier
+PRICE_OUT_1M = None           # FILL IN: USD per 1M output tokens; 0.0 on the free tier
+JUDGE_RPM = None              # FILL IN: requests/minute limit shown in AI Studio (use a bit less)
+JUDGE_TPM = None              # FILL IN: tokens/minute limit (use a bit less)
+JUDGE_RPD = None              # FILL IN: requests/day limit (use a bit less)
 # ------------------------------------------
 
 REPO_URL = "https://github.com/Gauravsharma2711/ai-sprints-research.git"
@@ -61,11 +65,14 @@ PER_MODEL = {   # mirrors config.yaml: (tensor_parallel, vLLM --quantization)
     "phi-3.5-mini": (1, None),
 }
 TP, QUANT = PER_MODEL[MODEL]
-JUDGE_BASE_URL, JUDGE_KEY = {"groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
-                             "xai":  ("https://api.x.ai/v1", "XAI_API_KEY")}[JUDGE_PROVIDER]
+JUDGE_BASE_URL, JUDGE_KEY = {
+    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY"),
+    "groq":   ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+    "xai":    ("https://api.x.ai/v1", "XAI_API_KEY"),
+}[JUDGE_PROVIDER]
 UNV = "--allow-unverified" if ALLOW_UNVERIFIED else ""
 LORA_PATH, LORA_NAME = None, "contract_sft"   # tuned-model session only (see the end)
-print("model:", MODEL, "| TP:", TP, "| quant:", QUANT)
+print("model:", MODEL, "| TP:", TP, "| quant:", QUANT, "| judge:", JUDGE_PROVIDER, JUDGE_MODEL or "(not set)")
 ```
 
 ## Cell 2: secrets, clone the repo, install requirements
@@ -81,12 +88,12 @@ def sh(cmd, timeout=None, show=True):
     return p.returncode
 
 sec = UserSecretsClient()
-for k in ["HF_TOKEN", "XAI_API_KEY", "GROQ_API_KEY"]:
+for k in ["HF_TOKEN", "GEMINI_API_KEY", "GROQ_API_KEY", "XAI_API_KEY"]:
     try:
         os.environ[k] = sec.get_secret(k)
         print(k, "loaded")                       # never prints the value
     except Exception:
-        print(k, "MISSING - attach it under Add-ons > Secrets")
+        print(k, "not attached" + (" - REQUIRED" if k in ("HF_TOKEN", JUDGE_KEY) else " (optional)"))
 os.environ["HF_HOME"] = "/tmp/hf"
 
 if not os.path.isdir(REPO):
@@ -118,8 +125,6 @@ else:
 
 ```python
 import yaml
-assert JUDGE_MODEL and PRICE_IN_1M is not None and PRICE_OUT_1M is not None, \
-    "Fill in the judge block (model and prices) in Cell 1, then rerun Cells 1 and 3."
 CFG = f"{REPO}/config.yaml"
 
 def _edit(fn):
@@ -129,22 +134,30 @@ def apply_settings(c):
     s = next(x for x in c["subjects"] if x["name"] == MODEL)
     assert s["tensor_parallel"] == TP, (s["tensor_parallel"], TP)
     s["confirmed"] = True                      # you have checked the HF id, licence and T4 fit
-    c["judge"].update(provider=JUDGE_PROVIDER, model=JUDGE_MODEL, family=JUDGE_FAMILY,
+    c["judge"].update(provider=JUDGE_PROVIDER, model=JUDGE_MODEL or None, family=JUDGE_FAMILY,
                       base_url=JUDGE_BASE_URL, api_key_env=JUDGE_KEY, max_tokens=JUDGE_MAX_TOKENS,
+                      reasoning_effort=JUDGE_REASONING_EFFORT,
                       price_per_1m_input_usd=PRICE_IN_1M, price_per_1m_output_usd=PRICE_OUT_1M)
-    c["judge"]["rate_limits"]["requests_per_day"] = JUDGE_REQUESTS_PER_DAY
+    c["judge"]["rate_limits"].update(requests_per_minute=JUDGE_RPM, tokens_per_minute=JUDGE_TPM,
+                                     requests_per_day=JUDGE_RPD)
 
 def set_cap(usd):
     """Call only with an amount YOU approved after reading an --estimate printout."""
     _edit(lambda c: c["budget"].__setitem__("max_spend_usd", float(usd)))
     print("judge spend cap set to $", usd)
 
+def judge_ready():
+    assert JUDGE_MODEL and PRICE_IN_1M is not None and PRICE_OUT_1M is not None, \
+        "Fill in JUDGE_MODEL and the two prices in Cell 1, then rerun Cells 1 and 3."
+
 cfg = _edit(apply_settings)
 HF_MODEL = next(x for x in cfg["subjects"] if x["name"] == MODEL)["hf_id"]
-print("will serve:", HF_MODEL, "| judge:", JUDGE_PROVIDER, JUDGE_MODEL, "| cap: $", cfg["budget"]["max_spend_usd"])
+print("will serve:", HF_MODEL, "| judge:", JUDGE_PROVIDER, JUDGE_MODEL or "(not set)",
+      "| cap: $", cfg["budget"]["max_spend_usd"])
 ```
 
-The spend cap starts at $0, so every paid run refuses until you call `set_cap(...)` (Cells 7 and 10).
+The spend cap starts at $0. On Gemini's free tier the estimate is $0 and nothing needs approving;
+with paid prices, approve each printed amount with `set_cap(...)` before the step that spends it.
 
 ## Cell 4: hardware check
 
@@ -173,6 +186,7 @@ sh("/tmp/vllm-env/bin/python -c \"import vllm, torch; print(vllm.__version__, to
   (a `libcudart.so.13` error later means a wrong build).
 - If it fails: set `VLLM_SPEC = "vllm==0.9.2"` in Cell 1, rerun Cells 1 and 5 once. If that also
   fails, stop and ask Claude for the Hugging Face fallback backend.
+- Within one session vLLM stays installed: after changing `MODEL`, rerun Cells 1, 3 and 6 only.
 
 ## Cell 6: start the vLLM server (up to 15 minutes)
 
@@ -204,7 +218,7 @@ if not ready:
     print("NOT READY. Log tail:\n", open("/kaggle/working/vllm_server.log").read()[-3000:])
 ```
 
-## Cell 7: quick checks + smoke-test estimate
+## Cell 7: quick checks
 
 ```python
 from openai import OpenAI
@@ -214,28 +228,39 @@ r = local.chat.completions.create(model=LORA_NAME if LORA_PATH else HF_MODEL,
     messages=[{"role": "user", "content": "Answer with one word, Yes or No: Is the sky blue on a clear day?"}],
     max_tokens=1, temperature=0, logprobs=True, top_logprobs=5)
 print("logprobs:", [(t.token, round(t.logprob, 3)) for t in r.choices[0].logprobs.content[0].top_logprobs])
-
-# b) judge (one tiny call): must print exactly PROBABILITY_YES: 0.50
-judge = OpenAI(base_url=JUDGE_BASE_URL, api_key=os.environ[JUDGE_KEY])
-j = judge.chat.completions.create(model=JUDGE_MODEL, temperature=0, max_tokens=JUDGE_MAX_TOKENS,
-    messages=[{"role": "user", "content": "Reply exactly: PROBABILITY_YES: 0.50"}])
-print("judge:", repr(j.choices[0].message.content), "| finish:", j.choices[0].finish_reason)
-assert "PROBABILITY_YES" in (j.choices[0].message.content or ""), "empty judge reply: raise JUDGE_MAX_TOKENS"
-
 ```
+
+```python
+# b) judge: list the model ids your key can use (free), then one tiny test call
+judge = OpenAI(base_url=JUDGE_BASE_URL, api_key=os.environ[JUDGE_KEY])
+try:
+    print("models:", sorted(m.id for m in judge.models.list()))
+except Exception as e:
+    print("could not list models here; copy the id from AI Studio:", type(e).__name__)
+judge_ready()
+extra = {"reasoning_effort": JUDGE_REASONING_EFFORT} if JUDGE_REASONING_EFFORT else {}
+j = judge.chat.completions.create(model=JUDGE_MODEL, temperature=0, max_tokens=JUDGE_MAX_TOKENS,
+    messages=[{"role": "user", "content": "Reply exactly: PROBABILITY_YES: 0.50"}], **extra)
+print("judge:", repr(j.choices[0].message.content), "| finish:", j.choices[0].finish_reason, "|", j.usage)
+assert "PROBABILITY_YES" in (j.choices[0].message.content or ""), "empty judge reply: raise JUDGE_MAX_TOKENS"
+```
+
+If the list shows ids like `models/gemini-...`, use the id exactly as printed for `JUDGE_MODEL`.
+If the test call errors on `reasoning_effort`, set `JUDGE_REASONING_EFFORT = None` and rerun
+Cells 1, 3 and 7b.
 
 ```python
 # c) smoke-test estimate (free): call counts and worst-case judge cost
 !"{sys.executable}" -m src.harness --models {MODEL} --limit {LIMIT} --out-dir results/smoke --estimate
 ```
 
-Read the worst-case cost. If you approve it, run `set_cap(<that amount, rounded up>)`:
+If the worst case is above $0 and you approve it: `set_cap(<that amount, rounded up>)`.
 
 ```python
-set_cap(1.00)   # EDIT to the amount you approved
+set_cap(0.00)   # EDIT only if the estimate above is above $0 and you approved it
 ```
 
-## Cell 8: smoke test (writes to results/smoke, never mixed with real results)
+## Cell 8: smoke test (judge included; writes to results/smoke, never mixed with real results)
 
 ```python
 t1 = time.time()
@@ -249,11 +274,11 @@ print("smoke seconds:", round(smoke_seconds))
 !"{sys.executable}" -m src.harness --show-histories --out-dir results/smoke --condition contract_prompt
 ```
 
-Pass checks: the status table at the end is mostly `ok` (few `nan_*`); the transcripts read
-sensibly. Exit code 2 = refused (the message says why); 3 = stopped early (cap reached).
+Pass checks: the status table at the end is mostly `ok` (few `nan_*`), including the `judge` row;
+the transcripts read sensibly. Exit code 2 = refused (the message says why); 3 = stopped early.
 Under `contract_prompt` the logit probe may be NaN by design.
 
-## Cell 9: time and cost for the full run
+## Cell 9: time estimate for the GPU run
 
 ```python
 if "smoke_seconds" in globals():           # set by Cell 8; not present in a resumed session
@@ -261,31 +286,43 @@ if "smoke_seconds" in globals():           # set by Cell 8; not present in a res
     print(f"~{per_item:.0f}s per item -> ~{per_item * 60 / 3600:.1f} h for all 60 items of {MODEL}")
 else:
     print("no smoke test in this session: skipping the time estimate")
-!"{sys.executable}" -m src.harness --models {MODEL} --estimate
+!"{sys.executable}" -m src.harness --models {MODEL} --skip-judge --estimate
 ```
 
-If one model needs more than about 4 hours, tell Claude (the model list needs trimming).
-Otherwise, if you approve the printed worst-case judge cost (it includes what was already spent):
+The GPU run makes no judge calls, so its cost is $0. If one model needs more than about 4 hours,
+tell Claude (the model list needs trimming).
+
+## Cell 10: full GPU run (subject arms only; judge saved as pending)
 
 ```python
-set_cap(5.00)   # EDIT to the total you approved
-```
-
-## Cell 10: full run
-
-```python
-!"{sys.executable}" -u -m src.harness --models {MODEL} --approve-spend {UNV}
+!"{sys.executable}" -u -m src.harness --models {MODEL} --skip-judge {UNV}
 ```
 
 Saves after every finished cell to `results/raw/results.csv` and
-`results/raw/trajectories/<model>.jsonl`.
+`results/raw/trajectories/<model>.jsonl`. The status table shows `judge pending=...`: that is
+expected until Cell 11.
 
-**If the session dies:** start a new session, attach the last `results_*.zip` as a dataset named
-`prev-results`, then run Cells 1, 2, 3, 4, 5, 6, **9** (the spend cap resets to $0 in every new
-session, so approve the remaining cost again with `set_cap`), then 10 and 11. Finished cells are
-skipped: the estimate shows how many remain. Cells 7 and 8 can be skipped when resuming.
+## Cell 11: judge pass (Gemini, no GPU needed)
 
-## Cell 11: package and stop
+```python
+judge_ready()
+!"{sys.executable}" -m src.harness --judge-only --estimate
+```
+
+This counts every cell needing the judge (pending, failed, or scored by another judge model,
+across all models in `results.csv`). If the worst case is above $0 and you approve it, run
+`set_cap(...)`. Then:
+
+```python
+!"{sys.executable}" -u -m src.harness --judge-only --approve-spend
+```
+
+- Exit code 3 = stopped at the daily limit (`JUDGE_RPD`). Everything judged so far is saved;
+  run this cell again after Gemini's daily reset (midnight Pacific time), in this session or a
+  later one, or on your own computer (see "Judge on your computer").
+- It prints `cells still needing the judge: N`. When N is 0, every J comes from `JUDGE_MODEL`.
+
+## Cell 12: package and stop
 
 ```python
 import pandas as pd
@@ -296,12 +333,19 @@ shutil.make_archive(f"/kaggle/working/results_{tag}", "zip", f"{REPO}/results/ra
 
 df = pd.read_csv(f"{REPO}/results/raw/results.csv")
 print("rows:", len(df), "| by model:", df["subject"].value_counts().to_dict())
+print("judge status:", df["status_judge"].value_counts().to_dict())
 st = [c for c in df.columns if c.startswith("status_")]
 print("share not ok, per arm:\n", (df[st] != "ok").mean().round(3).sort_values(ascending=False))
 print("session hours:", round((time.time() - START) / 3600, 2))
 ```
 
 Download `results_<model>.zip` from the Output tab.
+
+## If the session dies, or for the next model
+
+Start a new session, attach the last `results_*.zip` as a dataset named `prev-results`, set
+`MODEL` in Cell 1, then run Cells 1-6, 9, 10, 11, 12 (Cells 7-8 can be skipped when resuming the
+same model). Finished cells are skipped: the estimates show how many remain.
 
 ## After each session (on your computer)
 
@@ -311,17 +355,28 @@ Unzip into the repo's `results/raw/` (keep the `trajectories/` folder), then:
 git add results/raw && git commit -m "Results: <model>" && git push
 ```
 
-For the next model: in Kaggle, upload that zip as a dataset, attach it so it appears under
-`/kaggle/input/prev-results`, change `MODEL` in Cell 1, and run all cells again.
+## Judge on your computer (instead of, or after, Cell 11)
+
+Needs only Python and the Gemini key; no GPU. In the repo folder, with `results/raw/` unzipped,
+`GEMINI_API_KEY=...` in your `.env`, and `config.yaml`'s `judge:` block filled in exactly as in
+Cell 1 (model, prices, rate limits):
+
+```bash
+.venv/Scripts/python -m src.harness --judge-only --estimate
+```
+
+```bash
+.venv/Scripts/python -m src.harness --judge-only --approve-spend
+```
 
 ## Models
 
 | MODEL | HF id (config.yaml) | GPUs | Note |
 |---|---|---|---|
-| `llama-3.1-8b` | meta-llama/Llama-3.1-8B-Instruct | 2 | accept the licence on HF first |
-| `qwen2.5-7b` | Qwen/Qwen2.5-7B-Instruct-AWQ | 1 | AWQ 4-bit |
-| `mistral-7b` | mistralai/Mistral-7B-Instruct-v0.3 | 2 | |
-| `phi-3.5-mini` | microsoft/Phi-3.5-mini-instruct | 1 | |
+| `llama-3.1-8b` | meta-llama/Llama-3.1-8B-Instruct | 2 | gated: wait for Meta's approval on HF |
+| `qwen2.5-7b` | Qwen/Qwen2.5-7B-Instruct-AWQ | 1 | AWQ 4-bit, open |
+| `mistral-7b` | mistralai/Mistral-7B-Instruct-v0.3 | 2 | accept terms on HF |
+| `phi-3.5-mini` | microsoft/Phi-3.5-mini-instruct | 1 | open |
 
 ## Tuned model (later, after `python -m src.adaption_pipeline fetch`)
 

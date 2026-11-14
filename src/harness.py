@@ -85,6 +85,8 @@ RESULT_COLUMNS: tuple[str, ...] = (
 )
 SUBJECT_CALLS_PER_CELL = len(ALL_ARMS) - 1  # all arms except judge
 STOP_ERRORS = (BudgetExceeded, DailyCapReached, FatalClientError)
+PENDING = "pending"   # judge arm not yet scored (--skip-judge); filled in by --judge-only
+JUDGED_OK = ("ok", "reask_ok")
 
 
 class ConfigError(Exception):
@@ -124,6 +126,7 @@ class JudgeConfig:
     price_in_per_1m: float | None
     price_out_per_1m: float | None
     rate_limits: RateLimits = field(default_factory=RateLimits)
+    reasoning_effort: str | None = None
 
 
 @dataclass(frozen=True)
@@ -191,6 +194,7 @@ def load_config(path: Path) -> HarnessConfig:
                 requests_per_day=_opt_int(rl.get("requests_per_day")),
                 tokens_per_day=_opt_int(rl.get("tokens_per_day")),
             ),
+            reasoning_effort=j.get("reasoning_effort"),
         )
         sampling, conc, retries = raw["sampling"], raw["concurrency"], raw["retries"]
         cfg = HarnessConfig(
@@ -526,9 +530,9 @@ async def _all(*coros: Coroutine[Any, Any, T]) -> list[T]:
 
 
 class Runner:
-    def __init__(self, cfg: HarnessConfig, *, log: JsonlLog, writer: ResultsWriter, judge: Endpoint,
-                 turns: dict[str, list[str]], retry: RetryPolicy, protocol: str,
-                 scrub_terms: list[str]) -> None:
+    def __init__(self, cfg: HarnessConfig, *, log: JsonlLog, writer: ResultsWriter | None,
+                 judge: Endpoint | None, turns: dict[str, list[str]], retry: RetryPolicy, protocol: str,
+                 scrub_terms: list[str], skip_judge: bool = False) -> None:
         self.cfg = cfg
         self.log = log
         self.writer = writer
@@ -537,6 +541,7 @@ class Runner:
         self.retry = retry
         self.protocol = protocol
         self.scrub_terms = scrub_terms
+        self.skip_judge = skip_judge
         self.rows: list[dict[str, Any]] = []
 
     # -- calls ---------------------------------------------------------------
@@ -647,9 +652,16 @@ class Runner:
             self.log.write("skipped", role="judge", arm="judge", **cell.fields(),
                            reason="nothing left after stripping", text=r1)
             return ArmResult(None, NAN, "nan_empty_prose")
+        if self.judge is None:
+            raise ConfigError("judge_arm called without a judge endpoint")
         req = ChatRequest(model=self.judge.model, messages=prompts.judge_messages(item.claim, prose),
-                          temperature=self.cfg.judge.temperature, max_tokens=self.cfg.judge.max_tokens)
+                          temperature=self.cfg.judge.temperature, max_tokens=self.cfg.judge.max_tokens,
+                          reasoning_effort=self.cfg.judge.reasoning_effort)
         return await self._ask_probability(self.judge, "judge", cell, "judge", req)
+
+    async def pending_judge(self) -> ArmResult:
+        """--skip-judge: the judge arm is filled in later by --judge-only."""
+        return ArmResult(None, NAN, PENDING)
 
     async def run_cell(self, subject: SubjectConfig, ep: Endpoint, condition: str,
                        item: BenchmarkItem, sample: int) -> dict[str, Any]:
@@ -662,8 +674,8 @@ class Runner:
         h = replace(h, r1=res["T1"].text, c1=res["T1"].value)
 
         phase2 = ("T2A", "T2B", "T2N", "T3a", "T3b", "T3c")
-        out = await _all(self.judge_arm(cell, item, res["T1"].text),
-                         *(self.prob_arm(ep, cell, a, h) for a in phase2))
+        judge = self.pending_judge() if self.skip_judge else self.judge_arm(cell, item, res["T1"].text)
+        out = await _all(judge, *(self.prob_arm(ep, cell, a, h) for a in phase2))
         res["judge"] = out[0]
         res.update(zip(phase2, out[1:]))
         h = replace(h, r2a=res["T2A"].text, r2n=res["T2N"].text)
@@ -692,6 +704,7 @@ class Runner:
         async def one(condition: str, item: BenchmarkItem, sample: int) -> None:
             async with gate:
                 row = await self.run_cell(subject, ep, condition, item, sample)
+                assert self.writer is not None
                 self.writer.write(row)  # checkpoint: one row per completed cell
                 self.rows.append(row)
 
@@ -718,6 +731,7 @@ class RunPlan:
     results_path: Path
     dry_run: bool
     protocol: str
+    skip_judge: bool = False
     run_id: str = field(default_factory=lambda: datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
                         + "-" + uuid.uuid4().hex[:6])
 
@@ -729,7 +743,7 @@ class RunOutcome:
 
 
 async def execute(plan: RunPlan, *, subject_client_for: Callable[[SubjectConfig], ChatClient],
-                  judge_client: ChatClient, judge_model: str, retry: RetryPolicy,
+                  judge_client: ChatClient | None, judge_model: str, retry: RetryPolicy,
                   judge_limiter: RateLimiter | None, judge_spend: SpendTracker | None) -> RunOutcome:
     cfg = plan.cfg
     log = JsonlLog(plan.log_dir, plan.run_id, plan.dry_run)
@@ -739,14 +753,18 @@ async def execute(plan: RunPlan, *, subject_client_for: Callable[[SubjectConfig]
               subjects=[{"name": s.name, "hf_id": s.hf_id, "family": s.family, "base_url": s.base_url,
                          "quantisation": s.quantisation, "tensor_parallel": s.tensor_parallel}
                         for s in plan.subjects],
-              judge={"provider": cfg.judge.provider, "family": cfg.judge.family, "model": judge_model,
-                     "base_url": judge_client.base_url},
+              judge=(None if plan.skip_judge else
+                     {"provider": cfg.judge.provider, "family": cfg.judge.family, "model": judge_model,
+                      "base_url": judge_client.base_url if judge_client else None}),
+              skip_judge=plan.skip_judge,
               sampling={"temperature": cfg.temperature, "max_tokens": cfg.max_tokens, "seed": cfg.seed},
               max_spend_usd=cfg.max_spend_usd)
-    judge_ep = Endpoint(judge_client, judge_model, asyncio.Semaphore(cfg.judge_concurrency),
-                        judge_limiter, judge_spend)
+    judge_ep = (None if judge_client is None else
+                Endpoint(judge_client, judge_model, asyncio.Semaphore(cfg.judge_concurrency),
+                         judge_limiter, judge_spend))
     runner = Runner(cfg, log=log, writer=writer, judge=judge_ep, turns=plan.turns, retry=retry,
-                    protocol=plan.protocol, scrub_terms=scrub_terms_for(cfg.subjects))
+                    protocol=plan.protocol, scrub_terms=scrub_terms_for(cfg.subjects),
+                    skip_judge=plan.skip_judge)
     stop_reason: str | None = None
     try:
         for subject in plan.subjects:
@@ -821,19 +839,25 @@ class Estimate:
 
 
 def estimate_run(cfg: HarnessConfig, items: list[BenchmarkItem], cells_total: int,
-                 cells_remaining: int, usage: JudgeUsage) -> Estimate:
+                 cells_remaining: int, usage: JudgeUsage, judge_cells: int | None = None) -> Estimate:
+    """``judge_cells``: judge calls to price (default: one per remaining cell; 0 with --skip-judge)."""
     r = cells_remaining
+    jc = r if judge_cells is None else judge_cells
     reasks = cfg.reasks
     prose = "x" * (cfg.max_tokens * 4)  # a reply at the token cap
     per_in = max((approx_tokens(prompts.judge_messages(i.claim, prose)) for i in items), default=0)
     per_out = cfg.judge.max_tokens
     reask_in = per_in + per_out + approx_tokens([user(prompts.JUDGE_REASK_MESSAGE)])
-    tokens_in_exp, tokens_out_exp = r * per_in, r * per_out
-    tokens_in_max = r * (per_in + reasks * reask_in)
-    tokens_out_max = r * (1 + reasks) * per_out
+    tokens_in_exp, tokens_out_exp = jc * per_in, jc * per_out
+    tokens_in_max = jc * (per_in + reasks * reask_in)
+    tokens_out_max = jc * (1 + reasks) * per_out
     pin, pout = cfg.judge.price_in_per_1m, cfg.judge.price_out_per_1m
 
-    if pin is None or pout is None:
+    if jc == 0:
+        cost_exp = cost_max = 0.0
+        prior = None if pin is None or pout is None else (usage.tokens_in * pin + usage.tokens_out * pout) / 1e6
+        within, reason = True, "no judge calls in this run"
+    elif pin is None or pout is None:
         cost_exp = cost_max = prior = None
         within, reason = False, "judge prices are not set in config.yaml (price_per_1m_*_usd)"
     else:
@@ -848,7 +872,7 @@ def estimate_run(cfg: HarnessConfig, items: list[BenchmarkItem], cells_total: in
         cells_total=cells_total, cells_remaining=r,
         subject_calls=r * SUBJECT_CALLS_PER_CELL,
         subject_calls_max=r * (SUBJECT_CALLS_PER_CELL + reasks * len(SUBJECT_PROB_ARMS)),
-        judge_calls=r, judge_calls_max=r * (1 + reasks),
+        judge_calls=jc, judge_calls_max=jc * (1 + reasks),
         judge_tokens_in_max=tokens_in_max, judge_tokens_out_max=tokens_out_max,
         cost_expected_usd=cost_exp, cost_max_usd=cost_max, prior_spend_usd=prior,
         cap_usd=cfg.max_spend_usd, within_cap=within, reason=reason,
@@ -913,6 +937,174 @@ def show_histories(log_dir: Path, *, subject: str | None, condition: str | None,
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Judge-only pass: score T1 briefings from the logs, separately from the GPU run
+# ---------------------------------------------------------------------------
+
+JUDGE_CHECKPOINT_EVERY = 25
+
+
+def _cell_key(row: dict[str, Any]) -> CellKey:
+    return (str(row["subject"]), str(row["condition"]), str(row["item_id"]), int(row["sample"]))
+
+
+def judge_targets(rows: list[dict[str, str]], log_dir: Path, judge_model: str,
+                  subjects: set[str] | None) -> tuple[list[dict[str, str]], dict[tuple[CellKey, str], str]]:
+    """Rows needing a (re-)judgement, and the T1 reply text per (cell, run_id).
+
+    A row needs judging unless its judge status is ok/reask_ok AND the latest successful judge call
+    logged for that cell used ``judge_model``. So cells pending, failed, or scored by a different
+    judge model are (re-)judged, and every J ends up from the same judge.
+    """
+    t1_text: dict[tuple[CellKey, str], str] = {}
+    last_judge_model: dict[CellKey, str] = {}
+    for rec in iter_log_records(log_dir):
+        if rec.get("event") != "call" or rec.get("error") is not None or "subject" not in rec:
+            continue
+        key = (rec["subject"], rec["condition"], rec["item_id"], int(rec["sample"]))
+        if rec.get("role") == "subject" and rec.get("arm") == "T1" and rec.get("purpose") == "primary":
+            t1_text[(key, rec["run_id"])] = rec.get("text") or ""
+        elif rec.get("role") == "judge":
+            last_judge_model[key] = rec["request"]["model"]
+    todo = [r for r in rows
+            if (subjects is None or r["subject"] in subjects)
+            and not (r["status_judge"] in JUDGED_OK and last_judge_model.get(_cell_key(r)) == judge_model)]
+    return todo, t1_text
+
+
+def _write_rows(path: Path, rows: list[dict[str, str]]) -> None:
+    tmp = path.with_suffix(".csv.tmp")
+    with tmp.open("w", encoding="utf-8", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=list(RESULT_COLUMNS))
+        writer.writeheader()
+        writer.writerows(rows)
+    os.replace(tmp, path)
+
+
+async def run_judge_pass(cfg: HarnessConfig, *, rows: list[dict[str, str]], todo: list[dict[str, str]],
+                         t1_text: dict[tuple[CellKey, str], str], items: dict[str, BenchmarkItem],
+                         results_path: Path, log: JsonlLog, judge_ep: Endpoint, retry: RetryPolicy,
+                         turns: dict[str, list[str]], protocol: str) -> tuple[int, Counter[str], str | None]:
+    runner = Runner(cfg, log=log, writer=None, judge=judge_ep, turns=turns, retry=retry, protocol=protocol,
+                    scrub_terms=scrub_terms_for(cfg.subjects))
+    index = {_cell_key(r): r for r in rows}
+    statuses: Counter[str] = Counter()
+    done = 0
+
+    async def one(row: dict[str, str]) -> None:
+        nonlocal done
+        key = _cell_key(row)
+        cell = CellRef(*key)
+        item = items.get(row["item_id"])
+        r1 = t1_text.get((key, row["run_id"]))
+        if item is None or r1 is None:
+            log.write("skipped", role="judge", arm="judge", **cell.fields(),
+                      reason="item or T1 reply for this row's run_id not found in the logs")
+            res = ArmResult(None, NAN, "nan_dependency")
+        else:
+            res = await runner.judge_arm(cell, item, r1)
+        index[key]["J"] = _fmt(res.value)
+        index[key]["status_judge"] = res.status
+        statuses[res.status] += 1
+        done += 1
+        if done % JUDGE_CHECKPOINT_EVERY == 0:
+            _write_rows(results_path, rows)
+
+    stop: str | None = None
+    try:
+        async with asyncio.TaskGroup() as tg:
+            for row in todo:
+                tg.create_task(one(row))
+    except BaseException as exc:
+        leaves = _leaves(exc)
+        if leaves and all(isinstance(e, STOP_ERRORS) for e in leaves):
+            stop = "; ".join(sorted({f"{type(e).__name__}: {e}" for e in leaves}))
+        else:
+            raise
+    finally:
+        _write_rows(results_path, rows)   # always save what was judged
+    return done, statuses, stop
+
+
+def judge_only(cfg: HarnessConfig, args: argparse.Namespace, *, log_dir: Path, results_path: Path,
+               subjects: list[SubjectConfig], mock_factory: Callable[[Role], ChatClient] | None) -> int:
+    if not results_path.exists():
+        raise ConfigError(f"no results at {results_path}; run the harness first")
+    turns = load_turns(cfg.paths["turns"])
+    protocol = protocol_hash(cfg.paths["benchmark"], turns)
+    read_done_keys(results_path, protocol)                      # header + protocol checks
+    with results_path.open(encoding="utf-8", newline="") as fh:
+        rows = list(csv.DictReader(fh))
+    items_list, _ = load_items(cfg.paths["benchmark"])
+    items = {i.id: i for i in items_list}
+    judge_model = cfg.judge.model or ("mock-judge" if args.dry_run else "")
+    todo, t1_text = judge_targets(rows, log_dir, judge_model, {s.name for s in subjects})
+    print(f"== Judge-only pass with {cfg.judge.provider} {judge_model!r}: {len(todo)} of {len(rows)} cells "
+          "need judging (pending, failed, or scored by another judge model)")
+
+    usage_dirs = {cfg.paths["raw_log_dir"].resolve(), log_dir.resolve()}
+    parts = [read_judge_usage(d) for d in sorted(usage_dirs)]
+    usage = JudgeUsage(*(sum(getattr(p, f) for p in parts)
+                         for f in ("tokens_in", "tokens_out", "requests_today", "tokens_today")))
+    est = estimate_run(cfg, items_list, len(rows), 0, usage, judge_cells=len(todo))
+    print_estimate(est, args.dry_run)
+    if args.estimate or not todo:
+        return 0 if est.within_cap else 2
+
+    run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:6]
+    if args.dry_run:
+        client: ChatClient = (mock_factory or (lambda role: MockChatClient(role)))("judge")
+        retry = replace(cfg.retry, initial_wait_s=0.0, max_wait_s=0.0)
+        limiter = RateLimiter(cfg.judge.rate_limits)
+        spend = None
+    else:
+        problems = []
+        if not cfg.judge.model:
+            problems.append("judge.model is not set in config.yaml")
+        if not est.within_cap:
+            problems.append(f"budget: {est.reason}")
+        elif (est.cost_max_usd or 0.0) > 0 and not args.approve_spend:
+            problems.append(f"judge spend up to ${est.cost_max_usd:.4f}: ask the user, then re-run with "
+                            "--approve-spend")
+        if not problems:
+            from dotenv import load_dotenv
+
+            load_dotenv()
+            if not os.environ.get(cfg.judge.api_key_env):
+                problems.append(f"environment variable {cfg.judge.api_key_env} is not set")
+        if problems:
+            print("\nREFUSING TO START THE JUDGE PASS:", *(f"  - {p}" for p in problems), sep="\n", file=sys.stderr)
+            return 2
+        client = OpenAIChatClient(cfg.judge.base_url, os.environ[cfg.judge.api_key_env])
+        retry = cfg.retry
+        limiter = RateLimiter(cfg.judge.rate_limits, used_today_requests=usage.requests_today,
+                              used_today_tokens=usage.tokens_today)
+        pin, pout = cfg.judge.price_in_per_1m, cfg.judge.price_out_per_1m
+        prior = 0.0 if pin is None or pout is None else (usage.tokens_in * pin + usage.tokens_out * pout) / 1e6
+        spend = SpendTracker(cfg.max_spend_usd, pin, pout, spent_usd=prior)
+
+    log = JsonlLog(log_dir, run_id, args.dry_run)
+    log.write("run_start", mode="judge_only", protocol_hash=protocol, n_todo=len(todo),
+              judge={"provider": cfg.judge.provider, "family": cfg.judge.family, "model": judge_model,
+                     "base_url": client.base_url, "max_tokens": cfg.judge.max_tokens,
+                     "reasoning_effort": cfg.judge.reasoning_effort})
+    try:
+        judge_ep = Endpoint(client, judge_model, asyncio.Semaphore(cfg.judge_concurrency), limiter, spend)
+        done, statuses, stop = asyncio.run(run_judge_pass(
+            cfg, rows=rows, todo=todo, t1_text=t1_text, items=items, results_path=results_path, log=log,
+            judge_ep=judge_ep, retry=retry, turns=turns, protocol=protocol))
+    finally:
+        log.write("run_end", mode="judge_only")
+        log.close()
+    remaining = len(judge_targets(rows, log_dir, judge_model, {s.name for s in subjects})[0])
+    print(f"\n== Judged {done} cells -> {results_path}; statuses: {dict(sorted(statuses.items()))}")
+    print(f"   cells still needing the judge: {remaining}")
+    if stop:
+        print(f"   STOPPED EARLY: {stop}  (judged cells are saved; re-run --judge-only later to continue)")
+        return 3
+    return 0
+
+
 def _split(value: str | None) -> list[str] | None:
     return None if value is None else [v.strip() for v in value.split(",") if v.strip()]
 
@@ -932,6 +1124,10 @@ def parse_args(argv: list[str] | None) -> argparse.Namespace:
                    help="allow a real run on benchmark items that are not yet verified")
     p.add_argument("--out-dir", type=Path, default=None, help="override output directory")
     p.add_argument("--show-histories", action="store_true", help="print one cell's history per arm")
+    p.add_argument("--skip-judge", action="store_true",
+                   help="run the subject arms only; the judge arm is saved as 'pending' for --judge-only")
+    p.add_argument("--judge-only", action="store_true",
+                   help="judge every cell whose J is pending, failed or from another judge model (no GPU)")
     p.add_argument("--item", default=None)
     p.add_argument("--condition", default=None)
     p.add_argument("--sample", type=int, default=None)
@@ -951,8 +1147,8 @@ def _select(all_names: list[str], wanted: list[str] | None, what: str) -> list[s
 def _real_run_problems(cfg: HarnessConfig, subjects: list[SubjectConfig], items: list[BenchmarkItem],
                        est: Estimate, args: argparse.Namespace) -> list[str]:
     problems: list[str] = []
-    if not cfg.judge.model:
-        problems.append("judge.model is not set in config.yaml")
+    if not cfg.judge.model and not args.skip_judge:
+        problems.append("judge.model is not set in config.yaml (or pass --skip-judge)")
     unconfirmed = [s.name for s in subjects if not s.confirmed]
     if unconfirmed:
         problems.append(f"subjects not confirmed (set confirmed: true after checking HF id/licence/fit): "
@@ -970,7 +1166,8 @@ def _real_run_problems(cfg: HarnessConfig, subjects: list[SubjectConfig], items:
     from dotenv import load_dotenv
 
     load_dotenv()
-    needed = [cfg.judge.api_key_env, *(s.api_key_env for s in subjects if s.api_key_env)]
+    needed = [*([] if args.skip_judge else [cfg.judge.api_key_env]),
+              *(s.api_key_env for s in subjects if s.api_key_env)]
     problems += [f"environment variable {name} is not set" for name in needed if not os.environ.get(name)]
     return problems
 
@@ -978,7 +1175,8 @@ def _real_run_problems(cfg: HarnessConfig, subjects: list[SubjectConfig], items:
 async def _real_execute(plan: RunPlan, usage: JudgeUsage) -> RunOutcome:
     cfg = plan.cfg
     judge_model = str(cfg.judge.model)
-    judge_client = OpenAIChatClient(cfg.judge.base_url, os.environ[cfg.judge.api_key_env])
+    judge_client = (None if plan.skip_judge else
+                    OpenAIChatClient(cfg.judge.base_url, os.environ[cfg.judge.api_key_env]))
     clients: dict[str, ChatClient] = {}
     for s in plan.subjects:
         key = os.environ[s.api_key_env] if s.api_key_env else "EMPTY"
@@ -1031,9 +1229,14 @@ def _main(args: argparse.Namespace, mock_factory: Callable[[Role], ChatClient] |
     if args.show_histories:
         return show_histories(log_dir, subject=args.subject, condition=args.condition,
                               item_id=args.item, sample=args.sample)
+    if args.skip_judge and args.judge_only:
+        raise ConfigError("--skip-judge and --judge-only cannot be combined")
 
     names = _select([s.name for s in cfg.subjects], _split(args.models), "models")
     subjects = [s for s in cfg.subjects if s.name in names]
+    if args.judge_only:
+        return judge_only(cfg, args, log_dir=log_dir, results_path=results_path, subjects=subjects,
+                          mock_factory=mock_factory)
     conditions = _select(list(prompts.CONDITIONS), _split(args.conditions), "conditions")
 
     items, load_errors = load_items(cfg.paths["benchmark"])
@@ -1057,20 +1260,22 @@ def _main(args: argparse.Namespace, mock_factory: Callable[[Role], ChatClient] |
     parts = [read_judge_usage(d) for d in sorted(usage_dirs)]
     usage = JudgeUsage(*(sum(getattr(p, f) for p in parts)
                          for f in ("tokens_in", "tokens_out", "requests_today", "tokens_today")))
-    est = estimate_run(cfg, items, len(selected), len(selected - done), usage)
+    est = estimate_run(cfg, items, len(selected), len(selected - done), usage,
+                       judge_cells=0 if args.skip_judge else None)
     print_estimate(est, args.dry_run)
     if args.estimate:
         return 0 if est.within_cap else 2
 
     plan = RunPlan(cfg, subjects, conditions, items, turns, samples, log_dir, results_path,
-                   args.dry_run, protocol)
+                   args.dry_run, protocol, skip_judge=args.skip_judge)
     if args.dry_run:
         factory = mock_factory or (lambda role: MockChatClient(role))
         subject_clients: dict[str, ChatClient] = {}
         outcome = asyncio.run(execute(
             plan,
             subject_client_for=lambda s: subject_clients.setdefault(s.name, factory("subject")),
-            judge_client=factory("judge"), judge_model=cfg.judge.model or "mock-judge",
+            judge_client=None if args.skip_judge else factory("judge"),
+            judge_model=cfg.judge.model or "mock-judge",
             retry=replace(cfg.retry, initial_wait_s=0.0, max_wait_s=0.0),
             judge_limiter=None, judge_spend=None,
         ))

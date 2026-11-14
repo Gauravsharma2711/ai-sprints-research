@@ -11,6 +11,7 @@ Test-only substitutions (everything else runs exactly as written in the runbook)
 usage: python tools/kaggle_sim/run_sim.py docs/kaggle_runbook.md <empty temp dir> first|resume|second_model|smoke
 (resume/second_model expect <dir>/input/prev-results/ to hold an unzipped results_*.zip; needs ipython)
 """
+import os
 import re
 import subprocess
 import sys
@@ -51,14 +52,17 @@ sys.modules["torch"] = torch
 
 
 def subst(code: str) -> str:
+    if os.environ.get("SIM_REPO_URL"):   # test a local commit instead of GitHub
+        code = re.sub(r'^REPO_URL = .*$', f'REPO_URL = "{os.environ["SIM_REPO_URL"]}"', code, flags=re.M)
     code = code.replace("/kaggle/working", f"{root}/working").replace("/kaggle/input", f"{root}/input")
     code = re.sub(r'^JUDGE_MODEL  = .*$', 'JUDGE_MODEL  = "fake-judge"', code, flags=re.M)
-    code = code.replace("PRICE_IN_1M  = None", "PRICE_IN_1M  = 1.0").replace("PRICE_OUT_1M = None", "PRICE_OUT_1M = 2.0")
+    code = code.replace("PRICE_IN_1M  = None", "PRICE_IN_1M  = 0.0").replace("PRICE_OUT_1M = None", "PRICE_OUT_1M = 0.0")
     code = code.replace('"/tmp/vllm-env/bin/vllm", "serve", HF_MODEL,', f'sys.executable, "{FAKE}", HF_MODEL,')
-    for url in ("https://api.x.ai/v1", "https://api.groq.com/openai/v1"):
+    for url in ("https://api.x.ai/v1", "https://api.groq.com/openai/v1",
+                "https://generativelanguage.googleapis.com/v1beta/openai/"):
         code = code.replace(url, "http://127.0.0.1:8001/v1")
     if session == "second_model":
-        code = code.replace('MODEL = "llama-3.1-8b"', 'MODEL = "qwen2.5-7b"')
+        code = code.replace('MODEL = "qwen2.5-7b"', 'MODEL = "phi-3.5-mini"')
     return code
 
 
@@ -68,8 +72,8 @@ JUDGE_SERVER = subprocess.Popen([sys.executable, "{FAKE}", "fake-judge", "--port
 time.sleep(1.5)
 """
 
-plan = {"first": [1, 2, 3, "inject", 4, 6, 7, 8, 9, 10, 11],
-        "resume": [1, 2, 3, "inject", 6, 9, 10, 11],
+plan = {"first": [1, 2, 3, "inject", 4, 6, 7, 8, 9, 10, 11, 12],
+        "resume": [1, 2, 3, "inject", 6, 9, 10, 11, 12],
         "second_model": [1, 2, 3, "inject", 6, 9],
         "smoke": [1, 2, 3, "inject", 4, 6, 7, 8]}[session]
 shell = InteractiveShell.instance()
@@ -85,8 +89,7 @@ for step in plan:
         t0 = time.time()
         res = shell.run_cell(subst(code), store_history=False)
         rc = shell.user_ns.get("_exit_code", 0)
-        expected_refusal = "--estimate" in code and rc == 2   # cap still $0: refusal is by design
-        ok = res.success and (rc == 0 or expected_refusal)
+        ok = res.success and rc == 0   # free-tier prices: every estimate is $0, so no refusals
         print(f"--> {label}: {'OK' if ok else 'FAILED'} (shell exit {rc}, {time.time() - t0:.1f}s)", flush=True)
         if not ok:
             failures.append(label)
