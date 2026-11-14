@@ -8,7 +8,7 @@ Test-only substitutions (everything else runs exactly as written in the runbook)
   vllm serve                       -> fake_openai.py serving the same model id on :8000
   xAI judge                        -> fake_openai.py on :8001 (config judge.base_url patched)
   JUDGE_MODEL / prices             -> fake-judge, 1.0, 2.0
-usage: python tools/kaggle_sim/run_sim.py docs/kaggle_runbook.md <empty temp dir> first|resume|second_model
+usage: python tools/kaggle_sim/run_sim.py docs/kaggle_runbook.md <empty temp dir> first|resume|second_model|smoke
 (resume/second_model expect <dir>/input/prev-results/ to hold an unzipped results_*.zip; needs ipython)
 """
 import re
@@ -52,10 +52,11 @@ sys.modules["torch"] = torch
 
 def subst(code: str) -> str:
     code = code.replace("/kaggle/working", f"{root}/working").replace("/kaggle/input", f"{root}/input")
-    code = code.replace('JUDGE_MODEL  = ""', 'JUDGE_MODEL  = "fake-judge"')
+    code = re.sub(r'^JUDGE_MODEL  = .*$', 'JUDGE_MODEL  = "fake-judge"', code, flags=re.M)
     code = code.replace("PRICE_IN_1M  = None", "PRICE_IN_1M  = 1.0").replace("PRICE_OUT_1M = None", "PRICE_OUT_1M = 2.0")
     code = code.replace('"/tmp/vllm-env/bin/vllm", "serve", HF_MODEL,', f'sys.executable, "{FAKE}", HF_MODEL,')
-    code = code.replace("https://api.x.ai/v1", "http://127.0.0.1:8001/v1")
+    for url in ("https://api.x.ai/v1", "https://api.groq.com/openai/v1"):
+        code = code.replace(url, "http://127.0.0.1:8001/v1")
     if session == "second_model":
         code = code.replace('MODEL = "llama-3.1-8b"', 'MODEL = "qwen2.5-7b"')
     return code
@@ -69,7 +70,8 @@ time.sleep(1.5)
 
 plan = {"first": [1, 2, 3, "inject", 4, 6, 7, 8, 9, 10, 11],
         "resume": [1, 2, 3, "inject", 6, 9, 10, 11],
-        "second_model": [1, 2, 3, "inject", 6, 9]}[session]
+        "second_model": [1, 2, 3, "inject", 6, 9],
+        "smoke": [1, 2, 3, "inject", 4, 6, 7, 8]}[session]
 shell = InteractiveShell.instance()
 failures = []
 for step in plan:

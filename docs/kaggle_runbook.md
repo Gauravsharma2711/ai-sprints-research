@@ -8,11 +8,14 @@ token is needed.
 | Name | What |
 |---|---|
 | `HF_TOKEN` | Hugging Face token (accept the Llama 3.1 licence on HF first) |
-| `XAI_API_KEY` | xAI key for the judge |
-| `GROQ_API_KEY` | Groq key (second judge; not used in these cells) |
+| `GROQ_API_KEY` | Groq key: the judge (and later the second judge) |
+| `XAI_API_KEY` | only if `JUDGE_PROVIDER = "xai"` |
 
-**Before the first session, fill in 3 values in Cell 1:** `JUDGE_MODEL`, `PRICE_IN_1M`,
-`PRICE_OUT_1M` (all from the xAI console). Everything else is already set for the first model,
+**Before the first session, check the judge block in Cell 1.** It is set for Groq with
+`openai/gpt-oss-120b` (the setup that passed Cell 7). Fill in `PRICE_IN_1M` / `PRICE_OUT_1M` from
+the Groq console (0.0 only if your Groq account is on the free tier with no billing), and
+`JUDGE_REQUESTS_PER_DAY` from Groq's rate-limit page. To use xAI instead, set
+`JUDGE_PROVIDER = "xai"` and the xAI model, family and prices. Everything else is already set for the first model,
 `llama-3.1-8b`. For the other models, change only the `MODEL` line in Cell 1 (table at the end).
 
 Paste the cells in order.
@@ -36,9 +39,13 @@ START = time.time()
 
 # ---- the only lines you normally edit ----
 MODEL = "llama-3.1-8b"        # llama-3.1-8b | qwen2.5-7b | mistral-7b | phi-3.5-mini
-JUDGE_MODEL  = ""             # FILL IN: model name from the xAI console
-PRICE_IN_1M  = None           # FILL IN: USD per 1M input tokens (xAI console)
-PRICE_OUT_1M = None           # FILL IN: USD per 1M output tokens (xAI console)
+JUDGE_PROVIDER = "groq"       # "groq" or "xai"
+JUDGE_MODEL  = "openai/gpt-oss-120b"   # exactly as the provider lists it
+JUDGE_FAMILY = "openai"       # must differ from llama/qwen/mistral/phi (the harness checks)
+JUDGE_MAX_TOKENS = 300        # reasoning models need room to think (gpt-oss used ~80); 20 for non-reasoning
+PRICE_IN_1M  = None           # FILL IN: USD per 1M input tokens (provider console; 0.0 only if free)
+PRICE_OUT_1M = None           # FILL IN: USD per 1M output tokens
+JUDGE_REQUESTS_PER_DAY = None # FILL IN for Groq free tier (its daily request limit); None = no cap
 LIMIT = 3                     # smoke-test items
 ALLOW_UNVERIFIED = True       # set False once both annotators have reviewed the benchmark
 VLLM_SPEC = "vllm"            # if the vLLM install fails once, change to "vllm==0.9.2"
@@ -54,6 +61,8 @@ PER_MODEL = {   # mirrors config.yaml: (tensor_parallel, vLLM --quantization)
     "phi-3.5-mini": (1, None),
 }
 TP, QUANT = PER_MODEL[MODEL]
+JUDGE_BASE_URL, JUDGE_KEY = {"groq": ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
+                             "xai":  ("https://api.x.ai/v1", "XAI_API_KEY")}[JUDGE_PROVIDER]
 UNV = "--allow-unverified" if ALLOW_UNVERIFIED else ""
 LORA_PATH, LORA_NAME = None, "contract_sft"   # tuned-model session only (see the end)
 print("model:", MODEL, "| TP:", TP, "| quant:", QUANT)
@@ -110,7 +119,7 @@ else:
 ```python
 import yaml
 assert JUDGE_MODEL and PRICE_IN_1M is not None and PRICE_OUT_1M is not None, \
-    "Fill in JUDGE_MODEL, PRICE_IN_1M and PRICE_OUT_1M in Cell 1, then rerun Cells 1 and 3."
+    "Fill in the judge block (model and prices) in Cell 1, then rerun Cells 1 and 3."
 CFG = f"{REPO}/config.yaml"
 
 def _edit(fn):
@@ -120,8 +129,10 @@ def apply_settings(c):
     s = next(x for x in c["subjects"] if x["name"] == MODEL)
     assert s["tensor_parallel"] == TP, (s["tensor_parallel"], TP)
     s["confirmed"] = True                      # you have checked the HF id, licence and T4 fit
-    c["judge"].update(model=JUDGE_MODEL, price_per_1m_input_usd=PRICE_IN_1M,
-                      price_per_1m_output_usd=PRICE_OUT_1M)
+    c["judge"].update(provider=JUDGE_PROVIDER, model=JUDGE_MODEL, family=JUDGE_FAMILY,
+                      base_url=JUDGE_BASE_URL, api_key_env=JUDGE_KEY, max_tokens=JUDGE_MAX_TOKENS,
+                      price_per_1m_input_usd=PRICE_IN_1M, price_per_1m_output_usd=PRICE_OUT_1M)
+    c["judge"]["rate_limits"]["requests_per_day"] = JUDGE_REQUESTS_PER_DAY
 
 def set_cap(usd):
     """Call only with an amount YOU approved after reading an --estimate printout."""
@@ -130,7 +141,7 @@ def set_cap(usd):
 
 cfg = _edit(apply_settings)
 HF_MODEL = next(x for x in cfg["subjects"] if x["name"] == MODEL)["hf_id"]
-print("will serve:", HF_MODEL, "| judge:", JUDGE_MODEL, "| cap: $", cfg["budget"]["max_spend_usd"])
+print("will serve:", HF_MODEL, "| judge:", JUDGE_PROVIDER, JUDGE_MODEL, "| cap: $", cfg["budget"]["max_spend_usd"])
 ```
 
 The spend cap starts at $0, so every paid run refuses until you call `set_cap(...)` (Cells 7 and 10).
@@ -204,11 +215,13 @@ r = local.chat.completions.create(model=LORA_NAME if LORA_PATH else HF_MODEL,
     max_tokens=1, temperature=0, logprobs=True, top_logprobs=5)
 print("logprobs:", [(t.token, round(t.logprob, 3)) for t in r.choices[0].logprobs.content[0].top_logprobs])
 
-# b) xAI judge (one tiny paid call)
-judge = OpenAI(base_url="https://api.x.ai/v1", api_key=os.environ["XAI_API_KEY"])
-j = judge.chat.completions.create(model=JUDGE_MODEL, temperature=0, max_tokens=20,
+# b) judge (one tiny call): must print exactly PROBABILITY_YES: 0.50
+judge = OpenAI(base_url=JUDGE_BASE_URL, api_key=os.environ[JUDGE_KEY])
+j = judge.chat.completions.create(model=JUDGE_MODEL, temperature=0, max_tokens=JUDGE_MAX_TOKENS,
     messages=[{"role": "user", "content": "Reply exactly: PROBABILITY_YES: 0.50"}])
-print("judge:", j.choices[0].message.content)
+print("judge:", repr(j.choices[0].message.content), "| finish:", j.choices[0].finish_reason)
+assert "PROBABILITY_YES" in (j.choices[0].message.content or ""), "empty judge reply: raise JUDGE_MAX_TOKENS"
+
 ```
 
 ```python
