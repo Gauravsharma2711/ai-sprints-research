@@ -60,12 +60,12 @@ judge:
   family: google               # must differ from every subject family (checked in code)
   base_url: https://generativelanguage.googleapis.com/v1beta/openai/
   api_key_env: GEMINI_API_KEY
-  model: null                  # FILL IN: model id exactly as AI Studio lists it
+  model: gemini-3.1-flash-lite # chosen 14 Nov 2026; every J must come from this model (do not change mid-study)
   temperature: 0.0
   max_tokens: 300              # room for hidden reasoning; some Gemini models cannot turn it off
   reasoning_effort: low        # Gemini OpenAI-compat accepts minimal|low|medium|high; null = omit
-  price_per_1m_input_usd: null # FILL IN: 0.0 on the free tier, else the paid price
-  price_per_1m_output_usd: null
+  price_per_1m_input_usd: 0.0  # free tier (if billing is enabled later, set the paid prices)
+  price_per_1m_output_usd: 0.0
   # Self-imposed caps (null = no cap), set a little under the limits AI Studio shows for the model.
   # Per-minute caps make the harness wait; per-day caps stop the run cleanly (resume later).
   rate_limits:
