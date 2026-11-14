@@ -2,11 +2,11 @@
 
 **Notebook settings:** Accelerator **GPU T4 x2**, Internet **On**.
 
-**Secrets** (Add-ons → Secrets, attach all four to the notebook):
+**Secrets** (Add-ons → Secrets, attach them to the notebook). The repo is public, so no GitHub
+token is needed.
 
 | Name | What |
 |---|---|
-| `GITHUB_TOKEN` | Fine-grained token, only repo `ai-sprints-research`, Contents: Read-only |
 | `HF_TOKEN` | Hugging Face token (accept the Llama 3.1 licence on HF first) |
 | `XAI_API_KEY` | xAI key for the judge |
 | `GROQ_API_KEY` | Groq key (second judge; not used in these cells) |
@@ -15,7 +15,15 @@
 `PRICE_OUT_1M` (all from the xAI console). Everything else is already set for the first model,
 `llama-3.1-8b`. For the other models, change only the `MODEL` line in Cell 1 (table at the end).
 
-Paste the cells in order. Not yet run on Kaggle: the first session is the real test. If a cell
+Paste the cells in order.
+
+**What has been verified (14 Nov 2026, locally):** every cell ran in a real IPython kernel via
+`tools/kaggle_sim/run_sim.py`, with stand-ins for what only Kaggle has (stub Kaggle secrets and torch,
+a fake OpenAI-compatible server in place of vLLM and xAI). Passed: anonymous clone of the public
+repo, config edits, smoke test, history viewer, full 540-cell run through the real OpenAI client,
+packaging, restoring the zip in a new session (0 cells redone), and switching to a second model.
+**Not verifiable off Kaggle:** the vLLM install (Cell 5), the real GPU server and model, CUDA
+versions, real xAI responses. The first Kaggle session is the test of those. If a cell
 errors, paste the error and the last 30 lines of `/kaggle/working/vllm_server.log` to Claude.
 
 ---
@@ -23,7 +31,7 @@ errors, paste the error and the last 30 lines of `/kaggle/working/vllm_server.lo
 ## Cell 1: settings
 
 ```python
-import time, os
+import time, os, sys
 START = time.time()
 
 # ---- the only lines you normally edit ----
@@ -34,7 +42,7 @@ PRICE_OUT_1M = None           # FILL IN: USD per 1M output tokens (xAI console)
 LIMIT = 3                     # smoke-test items
 ALLOW_UNVERIFIED = True       # set False once both annotators have reviewed the benchmark
 VLLM_SPEC = "vllm"            # if the vLLM install fails once, change to "vllm==0.9.2"
-PREV_DIR = "/kaggle/input/prev-results"   # attach earlier results_*.zip here to resume
+PREV_DIR = "/kaggle/input/prev-results"   # earlier results_*.zip, uploaded as a dataset named prev-results
 # ------------------------------------------
 
 REPO_URL = "https://github.com/Gauravsharma2711/ai-sprints-research.git"
@@ -54,7 +62,7 @@ print("model:", MODEL, "| TP:", TP, "| quant:", QUANT)
 ## Cell 2: secrets, clone the repo, install requirements
 
 ```python
-import subprocess, shutil, glob, base64
+import subprocess, shutil, glob
 from kaggle_secrets import UserSecretsClient
 
 def sh(cmd, timeout=None, show=True):
@@ -64,7 +72,7 @@ def sh(cmd, timeout=None, show=True):
     return p.returncode
 
 sec = UserSecretsClient()
-for k in ["GITHUB_TOKEN", "HF_TOKEN", "XAI_API_KEY", "GROQ_API_KEY"]:
+for k in ["HF_TOKEN", "XAI_API_KEY", "GROQ_API_KEY"]:
     try:
         os.environ[k] = sec.get_secret(k)
         print(k, "loaded")                       # never prints the value
@@ -72,19 +80,13 @@ for k in ["GITHUB_TOKEN", "HF_TOKEN", "XAI_API_KEY", "GROQ_API_KEY"]:
         print(k, "MISSING - attach it under Add-ons > Secrets")
 os.environ["HF_HOME"] = "/tmp/hf"
 
-# Private repo: git reads the token from environment settings, never from a URL or printed text.
-basic = base64.b64encode(f"x-access-token:{os.environ['GITHUB_TOKEN']}".encode()).decode()
-os.environ.update({"GIT_CONFIG_COUNT": "1",
-                   "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-                   "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}"})
-
 if not os.path.isdir(REPO):
-    assert sh(f"git clone {REPO_URL} {REPO}") == 0, "clone failed: check GITHUB_TOKEN"
+    assert sh(f"git clone {REPO_URL} {REPO}") == 0, "clone failed: is Internet on?"
 else:
     sh(f"cd {REPO} && git checkout -- config.yaml && git pull")   # Cell 3 edits config.yaml
 os.chdir(REPO)
 sh("git log --oneline -1")
-sh("pip install -q -r requirements.txt")
+sh(f'"{sys.executable}" -m pip install -q -r requirements.txt')
 
 # Restore earlier results, keeping the layout the harness expects.
 raw, traj = f"{REPO}/results/raw", f"{REPO}/results/raw/trajectories"
@@ -164,7 +166,7 @@ sh("/tmp/vllm-env/bin/python -c \"import vllm, torch; print(vllm.__version__, to
 ## Cell 6: start the vLLM server (up to 15 minutes)
 
 ```python
-import requests
+import json, urllib.request
 env = dict(os.environ, VLLM_ATTENTION_BACKEND="XFORMERS", HF_HOME="/tmp/hf")
 cmd = ["/tmp/vllm-env/bin/vllm", "serve", HF_MODEL, "--dtype", "half", "--max-model-len", "4096",
        "--gpu-memory-utilization", "0.88", "--tensor-parallel-size", str(TP), "--port", "8000"]
@@ -182,9 +184,8 @@ for i in range(180):
     if server.poll() is not None:
         break
     try:
-        r = requests.get("http://localhost:8000/v1/models", timeout=3)
-        if r.ok:
-            print("READY:", [m["id"] for m in r.json()["data"]]); ready = True; break
+        with urllib.request.urlopen("http://localhost:8000/v1/models", timeout=3) as r:
+            print("READY:", [m["id"] for m in json.load(r)["data"]]); ready = True; break
     except Exception:
         pass
     time.sleep(5)
@@ -212,7 +213,7 @@ print("judge:", j.choices[0].message.content)
 
 ```python
 # c) smoke-test estimate (free): call counts and worst-case judge cost
-!python -m src.harness --models {MODEL} --limit {LIMIT} --out-dir results/smoke --estimate
+!"{sys.executable}" -m src.harness --models {MODEL} --limit {LIMIT} --out-dir results/smoke --estimate
 ```
 
 Read the worst-case cost. If you approve it, run `set_cap(<that amount, rounded up>)`:
@@ -225,14 +226,14 @@ set_cap(1.00)   # EDIT to the amount you approved
 
 ```python
 t1 = time.time()
-!python -u -m src.harness --models {MODEL} --limit {LIMIT} --out-dir results/smoke --approve-spend {UNV}
+!"{sys.executable}" -u -m src.harness --models {MODEL} --limit {LIMIT} --out-dir results/smoke --approve-spend {UNV}
 smoke_seconds = time.time() - t1
 print("smoke seconds:", round(smoke_seconds))
 ```
 
 ```python
 # full transcript of every arm for one cell
-!python -m src.harness --show-histories --out-dir results/smoke --condition contract_prompt
+!"{sys.executable}" -m src.harness --show-histories --out-dir results/smoke --condition contract_prompt
 ```
 
 Pass checks: the status table at the end is mostly `ok` (few `nan_*`); the transcripts read
@@ -242,9 +243,12 @@ Under `contract_prompt` the logit probe may be NaN by design.
 ## Cell 9: time and cost for the full run
 
 ```python
-per_item = smoke_seconds / LIMIT          # one item = 3 conditions x 3 samples x 11 calls
-print(f"~{per_item:.0f}s per item -> ~{per_item * 60 / 3600:.1f} h for all 60 items of {MODEL}")
-!python -m src.harness --models {MODEL} --estimate
+if "smoke_seconds" in globals():           # set by Cell 8; not present in a resumed session
+    per_item = smoke_seconds / LIMIT      # one item = 3 conditions x 3 samples x 11 calls
+    print(f"~{per_item:.0f}s per item -> ~{per_item * 60 / 3600:.1f} h for all 60 items of {MODEL}")
+else:
+    print("no smoke test in this session: skipping the time estimate")
+!"{sys.executable}" -m src.harness --models {MODEL} --estimate
 ```
 
 If one model needs more than about 4 hours, tell Claude (the model list needs trimming).
@@ -257,13 +261,16 @@ set_cap(5.00)   # EDIT to the total you approved
 ## Cell 10: full run
 
 ```python
-!python -u -m src.harness --models {MODEL} --approve-spend {UNV}
+!"{sys.executable}" -u -m src.harness --models {MODEL} --approve-spend {UNV}
 ```
 
 Saves after every finished cell to `results/raw/results.csv` and
-`results/raw/trajectories/<model>.jsonl`. If the session dies: new session, attach the last
-`results_*.zip` as a dataset at `PREV_DIR`, run Cells 1-6, then Cell 10 again; finished cells are
-skipped.
+`results/raw/trajectories/<model>.jsonl`.
+
+**If the session dies:** start a new session, attach the last `results_*.zip` as a dataset named
+`prev-results`, then run Cells 1, 2, 3, 4, 5, 6, **9** (the spend cap resets to $0 in every new
+session, so approve the remaining cost again with `set_cap`), then 10 and 11. Finished cells are
+skipped: the estimate shows how many remain. Cells 7 and 8 can be skipped when resuming.
 
 ## Cell 11: package and stop
 
