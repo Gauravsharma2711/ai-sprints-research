@@ -1,58 +1,60 @@
-# Kaggle runbook: one subject model per session
+# Kaggle runbook: copy-paste cells (one subject model per session)
 
-Paste the cells in order into a Kaggle notebook (GPU **T4 x2**, Internet **on**). Not yet run on
-Kaggle: the first session is the real test. Revised from the original draft to match this repo;
-changes are marked **[changed]**.
+**Notebook settings:** Accelerator **GPU T4 x2**, Internet **On**.
 
-## What the code expects (checked against the repo)
+**Secrets** (Add-ons → Secrets, attach all four to the notebook):
 
-- **[changed]** Run the harness as a module from the repo root: `python -m src.harness ...`.
-  `python src/harness.py` fails (`No module named 'src'`).
-- **[changed]** `--models` takes the subject **name** from `config.yaml` (`llama-3.1-8b`,
-  `qwen2.5-7b`, `mistral-7b`, `phi-3.5-mini`), not the Hugging Face id.
-- The harness reads `base_url` per subject from `config.yaml` (default `http://localhost:8000/v1`)
-  and sends the subject's `hf_id` as the model name. Before the first call it checks that the
-  server's `/v1/models` lists that id, so `vllm serve <hf_id>` (no renaming) is right.
-- **[changed]** A real run refuses to start until all of these hold (cell 0b sets them for the
-  session):
-  - `judge.model` and the judge prices are set
-  - the subject is `confirmed: true`
-  - the worst-case judge cost fits `budget.max_spend_usd`
-  - `--approve-spend` is passed (only after you have approved the printed estimate)
-  - `--allow-unverified` is passed while the benchmark items are still unreviewed
-- **[changed]** Raw logs are a directory, `results/raw/trajectories/<model>.jsonl`, not a single
-  `trajectories.jsonl`. Restoring must keep that folder structure (cell 1).
-- Results resume per cell from `results/raw/results.csv`. If prompts, items or turns change, the
-  harness refuses to mix rows (protocol hash) rather than silently continuing.
+| Name | What |
+|---|---|
+| `GITHUB_TOKEN` | Fine-grained token, only repo `ai-sprints-research`, Contents: Read-only |
+| `HF_TOKEN` | Hugging Face token (accept the Llama 3.1 licence on HF first) |
+| `XAI_API_KEY` | xAI key for the judge |
+| `GROQ_API_KEY` | Groq key (second judge; not used in these cells) |
 
-## Cell 0: parameters
+**Before the first session, fill in 3 values in Cell 1:** `JUDGE_MODEL`, `PRICE_IN_1M`,
+`PRICE_OUT_1M` (all from the xAI console). Everything else is already set for the first model,
+`llama-3.1-8b`. For the other models, change only the `MODEL` line in Cell 1 (table at the end).
+
+Paste the cells in order. Not yet run on Kaggle: the first session is the real test. If a cell
+errors, paste the error and the last 30 lines of `/kaggle/working/vllm_server.log` to Claude.
+
+---
+
+## Cell 1: settings
 
 ```python
 import time, os
 START = time.time()
 
-REPO_URL    = "https://github.com/<your-user>/<your-repo>.git"
-SUBJECT     = "llama-3.1-8b"   # [changed] subject NAME in config.yaml; HF id is read from there
-TP          = 2                # 2 for 7-8B fp16; 1 for AWQ or models up to ~4B (must match config)
-QUANT       = None             # "awq" for Qwen/Qwen2.5-7B-Instruct-AWQ
-LIMIT       = 3                # smoke-test items
-LORA_PATH   = None             # adapter dir for the tuned-model session (see "Tuned model" below)
-LORA_NAME   = "contract_sft"
-PREV_DIR    = "/kaggle/input/prev-results"   # attached dataset of earlier result zips, if any
-VLLM_SPEC   = "vllm"           # second attempt if the first fails: "vllm==0.9.2"
+# ---- the only lines you normally edit ----
+MODEL = "llama-3.1-8b"        # llama-3.1-8b | qwen2.5-7b | mistral-7b | phi-3.5-mini
+JUDGE_MODEL  = ""             # FILL IN: model name from the xAI console
+PRICE_IN_1M  = None           # FILL IN: USD per 1M input tokens (xAI console)
+PRICE_OUT_1M = None           # FILL IN: USD per 1M output tokens (xAI console)
+LIMIT = 3                     # smoke-test items
+ALLOW_UNVERIFIED = True       # set False once both annotators have reviewed the benchmark
+VLLM_SPEC = "vllm"            # if the vLLM install fails once, change to "vllm==0.9.2"
+PREV_DIR = "/kaggle/input/prev-results"   # attach earlier results_*.zip here to resume
+# ------------------------------------------
 
-# [changed] Judge settings and spend cap, applied to config.yaml for this session only (cell 0b).
-JUDGE_MODEL     = "<model name from the xAI console>"
-PRICE_IN_1M     = None   # USD per 1M input tokens, from the xAI console
-PRICE_OUT_1M    = None   # USD per 1M output tokens
-MAX_SPEND_USD   = 0.0    # raise only to the amount you approved after seeing --estimate
-ALLOW_UNVERIFIED = True  # set False once both annotators have reviewed data/benchmark/items.jsonl
+REPO_URL = "https://github.com/Gauravsharma2711/ai-sprints-research.git"
+REPO = "/kaggle/working/repo"
+PER_MODEL = {   # mirrors config.yaml: (tensor_parallel, vLLM --quantization)
+    "llama-3.1-8b": (2, None),
+    "qwen2.5-7b":   (1, "awq"),
+    "mistral-7b":   (2, None),
+    "phi-3.5-mini": (1, None),
+}
+TP, QUANT = PER_MODEL[MODEL]
+UNV = "--allow-unverified" if ALLOW_UNVERIFIED else ""
+LORA_PATH, LORA_NAME = None, "contract_sft"   # tuned-model session only (see the end)
+print("model:", MODEL, "| TP:", TP, "| quant:", QUANT)
 ```
 
-## Cell 1: secrets, repo, dependencies
+## Cell 2: secrets, clone the repo, install requirements
 
 ```python
-import subprocess, os, shutil, glob, base64
+import subprocess, shutil, glob, base64
 from kaggle_secrets import UserSecretsClient
 
 def sh(cmd, timeout=None, show=True):
@@ -62,80 +64,88 @@ def sh(cmd, timeout=None, show=True):
     return p.returncode
 
 sec = UserSecretsClient()
-for k in ["HF_TOKEN", "XAI_API_KEY", "GROQ_API_KEY", "GITHUB_TOKEN"]:
+for k in ["GITHUB_TOKEN", "HF_TOKEN", "XAI_API_KEY", "GROQ_API_KEY"]:
     try:
         os.environ[k] = sec.get_secret(k)
-        print(k, "loaded")                       # never print the value
+        print(k, "loaded")                       # never prints the value
     except Exception:
         print(k, "MISSING - attach it under Add-ons > Secrets")
 os.environ["HF_HOME"] = "/tmp/hf"
 
-# [changed] Private repo: authenticate git through an environment-only header, so the token never
-# appears in a command line, a URL or printed output. GITHUB_TOKEN = fine-grained, read-only, this repo.
-if os.environ.get("GITHUB_TOKEN"):
-    basic = base64.b64encode(f"x-access-token:{os.environ['GITHUB_TOKEN']}".encode()).decode()
-    os.environ.update({"GIT_CONFIG_COUNT": "1",
-                       "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
-                       "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}"})
+# Private repo: git reads the token from environment settings, never from a URL or printed text.
+basic = base64.b64encode(f"x-access-token:{os.environ['GITHUB_TOKEN']}".encode()).decode()
+os.environ.update({"GIT_CONFIG_COUNT": "1",
+                   "GIT_CONFIG_KEY_0": "http.https://github.com/.extraheader",
+                   "GIT_CONFIG_VALUE_0": f"AUTHORIZATION: basic {basic}"})
 
-REPO = "/kaggle/working/repo"
 if not os.path.isdir(REPO):
-    sh(f"git clone {REPO_URL} {REPO}")
+    assert sh(f"git clone {REPO_URL} {REPO}") == 0, "clone failed: check GITHUB_TOKEN"
 else:
-    sh(f"cd {REPO} && git pull")
+    sh(f"cd {REPO} && git checkout -- config.yaml && git pull")   # Cell 3 edits config.yaml
 os.chdir(REPO)
+sh("git log --oneline -1")
 sh("pip install -q -r requirements.txt")
 
-# [changed] Restore earlier results keeping the folder layout: results.csv -> results/raw/,
-# per-model logs -> results/raw/trajectories/. Kaggle unzips attached zips; files may be nested.
+# Restore earlier results, keeping the layout the harness expects.
 raw, traj = f"{REPO}/results/raw", f"{REPO}/results/raw/trajectories"
 os.makedirs(traj, exist_ok=True)
 if os.path.isdir(PREV_DIR):
     csvs = sorted(glob.glob(f"{PREV_DIR}/**/results.csv", recursive=True), key=os.path.getsize)
     if csvs:
-        shutil.copy(csvs[-1], f"{raw}/results.csv")       # the largest = most complete
-        print("results.csv from", csvs[-1], "| other copies ignored:", csvs[:-1])
+        shutil.copy(csvs[-1], f"{raw}/results.csv")      # the largest = most complete
+        print("results.csv from", csvs[-1])
     for f in glob.glob(f"{PREV_DIR}/**/trajectories/*.jsonl", recursive=True):
         dst = f"{traj}/{os.path.basename(f)}"
         if not os.path.exists(dst) or os.path.getsize(f) > os.path.getsize(dst):
             shutil.copy(f, dst)
-    print("raw now:", os.listdir(raw), "| trajectories:", os.listdir(traj))
+    print("raw:", sorted(os.listdir(raw)), "| trajectories:", sorted(os.listdir(traj)))
+else:
+    print("no earlier results attached: starting fresh")
 ```
 
-## Cell 0b: apply session settings to config.yaml  **[new]**
+## Cell 3: apply settings to config.yaml (this session only)
 
 ```python
 import yaml
-cfg_path = f"{REPO}/config.yaml"
-cfg = yaml.safe_load(open(cfg_path))
-subj = next(s for s in cfg["subjects"] if s["name"] == SUBJECT)
-HF_MODEL = subj["hf_id"]
-assert subj["tensor_parallel"] == TP, f"config says tensor_parallel={subj['tensor_parallel']}, cell 0 says {TP}"
-subj["confirmed"] = True             # you have checked the HF id, licence and T4 fit
-cfg["judge"]["model"] = JUDGE_MODEL
-cfg["judge"]["price_per_1m_input_usd"] = PRICE_IN_1M
-cfg["judge"]["price_per_1m_output_usd"] = PRICE_OUT_1M
-cfg["budget"]["max_spend_usd"] = MAX_SPEND_USD
-yaml.safe_dump(cfg, open(cfg_path, "w"), sort_keys=False)
-print("serving", HF_MODEL, "| judge", JUDGE_MODEL, "| cap $", MAX_SPEND_USD)
+assert JUDGE_MODEL and PRICE_IN_1M is not None and PRICE_OUT_1M is not None, \
+    "Fill in JUDGE_MODEL, PRICE_IN_1M and PRICE_OUT_1M in Cell 1, then rerun Cells 1 and 3."
+CFG = f"{REPO}/config.yaml"
+
+def _edit(fn):
+    c = yaml.safe_load(open(CFG)); fn(c); yaml.safe_dump(c, open(CFG, "w"), sort_keys=False); return c
+
+def apply_settings(c):
+    s = next(x for x in c["subjects"] if x["name"] == MODEL)
+    assert s["tensor_parallel"] == TP, (s["tensor_parallel"], TP)
+    s["confirmed"] = True                      # you have checked the HF id, licence and T4 fit
+    c["judge"].update(model=JUDGE_MODEL, price_per_1m_input_usd=PRICE_IN_1M,
+                      price_per_1m_output_usd=PRICE_OUT_1M)
+
+def set_cap(usd):
+    """Call only with an amount YOU approved after reading an --estimate printout."""
+    _edit(lambda c: c["budget"].__setitem__("max_spend_usd", float(usd)))
+    print("judge spend cap set to $", usd)
+
+cfg = _edit(apply_settings)
+HF_MODEL = next(x for x in cfg["subjects"] if x["name"] == MODEL)["hf_id"]
+print("will serve:", HF_MODEL, "| judge:", JUDGE_MODEL, "| cap: $", cfg["budget"]["max_spend_usd"])
 ```
 
-This edits only the Kaggle working copy. To make a setting permanent, change `config.yaml` in the
-repo and push.
+The spend cap starts at $0, so every paid run refuses until you call `set_cap(...)` (Cells 7 and 10).
 
-## Cell 2: hardware check
+## Cell 4: hardware check
 
 ```python
+import sys, torch
 sh("nvidia-smi")
-sh("python --version")      # [changed] must be 3.11+ (the harness uses asyncio.TaskGroup)
-import torch, sys
-assert sys.version_info >= (3, 11), sys.version
-print(torch.__version__, torch.version.cuda, torch.cuda.device_count())
+print(sys.version)
+assert sys.version_info >= (3, 11), "the harness needs Python 3.11+"
+print("torch", torch.__version__, "| CUDA", torch.version.cuda, "| GPUs:", torch.cuda.device_count())
 ```
 
-Expect two T4s. Note the `CUDA Version` in the `nvidia-smi` header.
+Expect 2 GPUs (Tesla T4). Note the `CUDA Version` in the `nvidia-smi` header; Cell 5 assumes 12.8.
 
-## Cell 3: vLLM in an isolated environment (time-boxed to 20 minutes)
+## Cell 5: install vLLM in its own environment (up to 20 minutes)
 
 ```python
 t0 = time.time()
@@ -146,19 +156,18 @@ print("rc:", rc, "| minutes:", round((time.time() - t0) / 60, 1))
 sh("/tmp/vllm-env/bin/python -c \"import vllm, torch; print(vllm.__version__, torch.version.cuda, torch.cuda.is_available())\"")
 ```
 
-- `cu128` assumes CUDA 12.8; change it if `nvidia-smi` shows otherwise (`libcudart.so.13` = wrong build).
-- If it fails, set `VLLM_SPEC = "vllm==0.9.2"` and rerun once. If both fail within 20 minutes,
-  stop: see "If vLLM fails" below.
+- If `nvidia-smi` shows a CUDA version other than 12.8, change `cu128` to match
+  (a `libcudart.so.13` error later means a wrong build).
+- If it fails: set `VLLM_SPEC = "vllm==0.9.2"` in Cell 1, rerun Cells 1 and 5 once. If that also
+  fails, stop and ask Claude for the Hugging Face fallback backend.
 
-## Cell 4: start the server
+## Cell 6: start the vLLM server (up to 15 minutes)
 
 ```python
 import requests
 env = dict(os.environ, VLLM_ATTENTION_BACKEND="XFORMERS", HF_HOME="/tmp/hf")
-cmd = ["/tmp/vllm-env/bin/vllm", "serve", HF_MODEL,
-       "--dtype", "half", "--max-model-len", "4096",          # matches config.yaml
-       "--gpu-memory-utilization", "0.88",
-       "--tensor-parallel-size", str(TP), "--port", "8000"]
+cmd = ["/tmp/vllm-env/bin/vllm", "serve", HF_MODEL, "--dtype", "half", "--max-model-len", "4096",
+       "--gpu-memory-utilization", "0.88", "--tensor-parallel-size", str(TP), "--port", "8000"]
 if QUANT:
     cmd += ["--quantization", QUANT]
 if LORA_PATH:
@@ -166,13 +175,12 @@ if LORA_PATH:
 if TP == 1:
     env["CUDA_VISIBLE_DEVICES"] = "0"
 
-log = open("/kaggle/working/vllm_server.log", "w")
-server = subprocess.Popen(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
-
+server = subprocess.Popen(cmd, env=env, stdout=open("/kaggle/working/vllm_server.log", "w"),
+                          stderr=subprocess.STDOUT)
 ready = False
-for i in range(180):                       # up to 15 minutes
+for i in range(180):
     if server.poll() is not None:
-        print("server exited; log tail:\n", open("/kaggle/working/vllm_server.log").read()[-3000:]); break
+        break
     try:
         r = requests.get("http://localhost:8000/v1/models", timeout=3)
         if r.ok:
@@ -181,133 +189,124 @@ for i in range(180):                       # up to 15 minutes
         pass
     time.sleep(5)
 if not ready:
-    print("Not ready. Log tail:\n", open("/kaggle/working/vllm_server.log").read()[-3000:])
+    print("NOT READY. Log tail:\n", open("/kaggle/working/vllm_server.log").read()[-3000:])
 ```
 
-## Cell 5: smoke tests, in order
+## Cell 7: quick checks + smoke-test estimate
 
 ```python
 from openai import OpenAI
-# 5a: local logprobs work? (free)
+# a) local logprobs (free)
 local = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
-r = local.chat.completions.create(
-    model=HF_MODEL if not LORA_PATH else LORA_NAME,
+r = local.chat.completions.create(model=LORA_NAME if LORA_PATH else HF_MODEL,
     messages=[{"role": "user", "content": "Answer with one word, Yes or No: Is the sky blue on a clear day?"}],
     max_tokens=1, temperature=0, logprobs=True, top_logprobs=5)
-print([(t.token, round(t.logprob, 3)) for t in r.choices[0].logprobs.content[0].top_logprobs])
+print("logprobs:", [(t.token, round(t.logprob, 3)) for t in r.choices[0].logprobs.content[0].top_logprobs])
 
-# 5b: xAI judge works? (one tiny paid call)
+# b) xAI judge (one tiny paid call)
 judge = OpenAI(base_url="https://api.x.ai/v1", api_key=os.environ["XAI_API_KEY"])
 j = judge.chat.completions.create(model=JUDGE_MODEL, temperature=0, max_tokens=20,
     messages=[{"role": "user", "content": "Reply exactly: PROBABILITY_YES: 0.50"}])
-print(j.choices[0].message.content)
+print("judge:", j.choices[0].message.content)
 ```
 
 ```python
-# 5c-1 [new]: estimate only (free). Prints call counts and worst-case judge cost vs your cap.
-UNV = "--allow-unverified" if ALLOW_UNVERIFIED else ""
-!python -m src.harness --models {SUBJECT} --limit {LIMIT} --out-dir results/smoke --estimate
+# c) smoke-test estimate (free): call counts and worst-case judge cost
+!python -m src.harness --models {MODEL} --limit {LIMIT} --out-dir results/smoke --estimate
 ```
 
-Approve the printed smoke cost (and set `MAX_SPEND_USD` to cover it) before 5c-2.
+Read the worst-case cost. If you approve it, run `set_cap(<that amount, rounded up>)`:
 
 ```python
-# 5c-2 [changed]: smoke run into a SEPARATE folder, so smoke rows never mix with the real results.
+set_cap(1.00)   # EDIT to the amount you approved
+```
+
+## Cell 8: smoke test (writes to results/smoke, never mixed with real results)
+
+```python
 t1 = time.time()
-!python -u -m src.harness --models {SUBJECT} --limit {LIMIT} --out-dir results/smoke --approve-spend {UNV}
+!python -u -m src.harness --models {MODEL} --limit {LIMIT} --out-dir results/smoke --approve-spend {UNV}
 smoke_seconds = time.time() - t1
 print("smoke seconds:", round(smoke_seconds))
 ```
 
 ```python
-# 5d [changed]: read a full transcript for every arm of one cell
+# full transcript of every arm for one cell
 !python -m src.harness --show-histories --out-dir results/smoke --condition contract_prompt
 ```
 
-Pass checks:
+Pass checks: the status table at the end is mostly `ok` (few `nan_*`); the transcripts read
+sensibly. Exit code 2 = refused (the message says why); 3 = stopped early (cap reached).
+Under `contract_prompt` the logit probe may be NaN by design.
 
-- 5a prints real log-probabilities.
-- 5b prints a probability line.
-- 5c-2 ends with a status table per arm: mostly `ok`, few `nan_*`. Exit codes: 2 = refused (it
-  says why), 3 = stopped early (budget or daily cap).
-- 5d histories read sensibly. `probe_mass` near 1 means the probe sees Yes/No tokens. Under
-  `contract_prompt` the probe may be NaN by design.
-
-## Cell 6: time estimate
+## Cell 9: time and cost for the full run
 
 ```python
-N_ITEMS = 60
-per_item = smoke_seconds / LIMIT        # one item = 3 conditions x 3 samples x 11 calls
-print(f"~{per_item:.0f}s per item -> ~{per_item * N_ITEMS / 3600:.1f} h for this model")
-!python -m src.harness --models {SUBJECT} --estimate      # [new] full-run judge cost vs cap
+per_item = smoke_seconds / LIMIT          # one item = 3 conditions x 3 samples x 11 calls
+print(f"~{per_item:.0f}s per item -> ~{per_item * 60 / 3600:.1f} h for all 60 items of {MODEL}")
+!python -m src.harness --models {MODEL} --estimate
 ```
 
-If one model needs more than about 4 hours, trim the model count. Approve the printed full-run
-judge cost and raise `MAX_SPEND_USD` (rerun cell 0b) before cell 7.
-
-## Cell 7: full run
+If one model needs more than about 4 hours, tell Claude (the model list needs trimming).
+Otherwise, if you approve the printed worst-case judge cost (it includes what was already spent):
 
 ```python
-!python -u -m src.harness --models {SUBJECT} --approve-spend {UNV}
+set_cap(5.00)   # EDIT to the total you approved
 ```
 
-Writes `results/raw/results.csv` and `results/raw/trajectories/<model>.jsonl` after every cell.
-If the session dies, start a new one from cell 0 with the zip from cell 8 attached as `PREV_DIR`;
-the harness skips finished cells. It prints log file sizes at the end and warns if any file
-approaches GitHub's 100 MB limit.
+## Cell 10: full run
 
-## Cell 8: package, stop server, report
+```python
+!python -u -m src.harness --models {MODEL} --approve-spend {UNV}
+```
+
+Saves after every finished cell to `results/raw/results.csv` and
+`results/raw/trajectories/<model>.jsonl`. If the session dies: new session, attach the last
+`results_*.zip` as a dataset at `PREV_DIR`, run Cells 1-6, then Cell 10 again; finished cells are
+skipped.
+
+## Cell 11: package and stop
 
 ```python
 import pandas as pd
 server.terminate()
-tag = SUBJECT + ("_lora" if LORA_PATH else "")
+tag = MODEL + ("_lora" if LORA_PATH else "")
 shutil.copy("/kaggle/working/vllm_server.log", f"{REPO}/results/raw/vllm_server_{tag}.log")
-shutil.make_archive(f"/kaggle/working/results_{tag}", "zip", f"{REPO}/results/raw")   # keeps trajectories/
+shutil.make_archive(f"/kaggle/working/results_{tag}", "zip", f"{REPO}/results/raw")
 
 df = pd.read_csv(f"{REPO}/results/raw/results.csv")
-print("rows:", len(df), "| by subject:", df["subject"].value_counts().to_dict())
-status_cols = [c for c in df.columns if c.startswith("status_")]
-print((df[status_cols] != "ok").mean().round(3).sort_values(ascending=False))   # [changed] NaN/failure rate per arm
+print("rows:", len(df), "| by model:", df["subject"].value_counts().to_dict())
+st = [c for c in df.columns if c.startswith("status_")]
+print("share not ok, per arm:\n", (df[st] != "ok").mean().round(3).sort_values(ascending=False))
 print("session hours:", round((time.time() - START) / 3600, 2))
 ```
 
-Download `results_<tag>.zip` from the Output tab. Then, on your machine, unzip it into
-`results/raw/` (keep `trajectories/`), commit and push. For the next model, attach the zip as
-`PREV_DIR`, change `SUBJECT`/`TP`/`QUANT` in cell 0, and start again.
+Download `results_<model>.zip` from the Output tab.
 
-## Per-model settings
+## After each session (on your computer)
 
-| SUBJECT | HF id (from config) | TP | QUANT |
+Unzip into the repo's `results/raw/` (keep the `trajectories/` folder), then:
+
+```bash
+git add results/raw && git commit -m "Results: <model>" && git push
+```
+
+For the next model: in Kaggle, upload that zip as a dataset, attach it so it appears under
+`/kaggle/input/prev-results`, change `MODEL` in Cell 1, and run all cells again.
+
+## Models
+
+| MODEL | HF id (config.yaml) | GPUs | Note |
 |---|---|---|---|
-| llama-3.1-8b | meta-llama/Llama-3.1-8B-Instruct (accept the licence on HF first) | 2 | None |
-| qwen2.5-7b | Qwen/Qwen2.5-7B-Instruct-AWQ | 1 | "awq" |
-| mistral-7b | mistralai/Mistral-7B-Instruct-v0.3 | 2 | None |
-| phi-3.5-mini | microsoft/Phi-3.5-mini-instruct | 1 | None |
+| `llama-3.1-8b` | meta-llama/Llama-3.1-8B-Instruct | 2 | accept the licence on HF first |
+| `qwen2.5-7b` | Qwen/Qwen2.5-7B-Instruct-AWQ | 1 | AWQ 4-bit |
+| `mistral-7b` | mistralai/Mistral-7B-Instruct-v0.3 | 2 | |
+| `phi-3.5-mini` | microsoft/Phi-3.5-mini-instruct | 1 | |
 
-## Tuned model (after `python -m src.adaption_pipeline fetch`)
+## Tuned model (later, after `python -m src.adaption_pipeline fetch`)
 
-1. Run the AutoScientist base model as an ordinary subject first (the manifest records which
-   model it chose). It needs its own `subjects:` entry if it is not already one of the four.
-2. Check what the downloaded checkpoint is. vLLM needs a LoRA adapter directory
-   (`adapter_config.json` + weights). The SDK only says "best trained model artifact", so this is
-   unverified.
-3. Add a subject whose `hf_id` is the served LoRA name, so the harness sends `contract_sft`:
-   ```yaml
-   - name: contract-sft
-     <<: *subject_defaults
-     hf_id: contract_sft        # = LORA_NAME passed to --lora-modules
-     family: <base model family>
-     quantisation: none
-     tensor_parallel: <as base>
-     confirmed: true
-   ```
-4. Set `HF_MODEL` (cell 0b sets it from the base subject; override it to the base id), `LORA_PATH`,
-   and `SUBJECT = "contract-sft"`, then run cells 4 to 8. Compare against the base under the
-   `default` condition.
-
-## If vLLM fails
-
-Not built yet: a Hugging Face backend (`attn_implementation="sdpa"`, batched generation, a Yes/No
-probe read from output scores) as a second client type in `src/clients.py`. Ask for it if needed.
-If a cell errors, paste the error and the last 30 lines of `vllm_server.log`.
+Not ready to paste yet. It needs: the base model AutoScientist chose (recorded in
+`data/train/manifest.json`) run as an ordinary subject; a check that the downloaded checkpoint
+is a LoRA adapter vLLM can load (the SDK only calls it "best trained model artifact"); and a
+`contract-sft` subject in `config.yaml` whose `hf_id` is `contract_sft`. Ask Claude to prepare
+that session when the checkpoint exists.
