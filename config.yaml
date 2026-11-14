@@ -1,0 +1,185 @@
+# Experiment configuration. Code reads endpoints, model ids and limits from here; nothing is hardcoded.
+# Keys are NOT stored here: each endpoint names the env var that holds its key.
+
+# ---------------------------------------------------------------------------
+# Subject models (served one at a time by vLLM on Kaggle T4 x2)
+# Candidates only: confirm each HF id, licence acceptance and T4 fit before use
+# (`confirmed: true`). T4 has no bf16 -> dtype half. 7-8B fp16 needs tp=2 or AWQ.
+# ---------------------------------------------------------------------------
+subject_defaults: &subject_defaults
+  base_url: http://localhost:8000/v1
+  api_key_env: null          # vLLM needs no key; set an env var name if you add --api-key
+  dtype: half
+  max_model_len: 4096
+  gpu_memory_utilization: 0.90
+
+subjects:
+  - name: llama-3.1-8b
+    <<: *subject_defaults
+    hf_id: meta-llama/Llama-3.1-8B-Instruct
+    family: llama
+    quantisation: none         # none | awq | gptq
+    tensor_parallel: 2
+    confirmed: false
+
+  - name: qwen2.5-7b
+    <<: *subject_defaults
+    hf_id: Qwen/Qwen2.5-7B-Instruct-AWQ
+    family: qwen
+    quantisation: awq
+    tensor_parallel: 1
+    confirmed: false
+
+  - name: mistral-7b
+    <<: *subject_defaults
+    hf_id: mistralai/Mistral-7B-Instruct-v0.3
+    family: mistral
+    quantisation: none
+    tensor_parallel: 2
+    confirmed: false
+
+  - name: phi-3.5-mini
+    <<: *subject_defaults
+    hf_id: microsoft/Phi-3.5-mini-instruct
+    family: phi
+    quantisation: none
+    tensor_parallel: 1
+    confirmed: false
+
+  # Adaption-tuned model and its base: add once AutoScientist selects a base (plan section 8).
+
+# ---------------------------------------------------------------------------
+# Judges (must be a different family from every subject; enforced in code)
+# ---------------------------------------------------------------------------
+judge:
+  provider: xai
+  family: grok
+  base_url: https://api.x.ai/v1
+  api_key_env: XAI_API_KEY
+  model: null                  # FILL IN from the xAI console before running
+  temperature: 0.0
+  max_tokens: 20
+  price_per_1m_input_usd: null # FILL IN from the xAI console; spend cap cannot be enforced without it
+  price_per_1m_output_usd: null
+  # Self-imposed caps (null = no cap). Per-minute caps make the harness wait; per-day caps stop the
+  # run (resume later). HTTP 429 responses are also retried, honouring Retry-After.
+  # Set these at or below the limits shown in the xAI console.
+  rate_limits:
+    requests_per_minute: 30
+    tokens_per_minute: null
+    requests_per_day: null
+    tokens_per_day: null
+
+second_judge:
+  provider: groq
+  base_url: https://api.groq.com/openai/v1
+  api_key_env: GROQ_API_KEY
+  model: null                  # FILL IN; record its family and check it differs from all subjects
+  family: null
+  temperature: 0.0
+  max_tokens: 20
+  n_briefings: 150             # stratified by model x tier
+  # Self-imposed caps. Set these at or below the limits shown in the Groq console for the chosen model.
+  rate_limits:
+    requests_per_minute: 30
+    tokens_per_minute: 6000
+    requests_per_day: 1000
+    tokens_per_day: 200000
+
+# ---------------------------------------------------------------------------
+# Sampling
+# ---------------------------------------------------------------------------
+sampling:
+  temperature: 0.7             # subject models; judges use their own temperature above
+  max_tokens: 350              # reply cap per subject turn
+  samples_per_cell: 3          # per item x condition x arm
+  seed: 1234                   # per-call seeds are derived from this + subject/condition/item/sample/arm
+  probe_top_logprobs: 20       # logit probe: top-k logprobs of the first token (vLLM default max is 20)
+
+concurrency:
+  subject: 8                   # parallel requests to the local vLLM server
+  judge: 2
+  second_judge: 1
+
+retries:
+  max_attempts: 4              # tenacity, for transport errors only (not parse failures)
+  reask_on_parse_failure: 1    # then NaN + logged parse_error
+  initial_wait_s: 2.0          # exponential backoff: 2, 4, 8 ... seconds
+  max_wait_s: 60.0             # also caps how long a Retry-After header can make us wait
+
+# ---------------------------------------------------------------------------
+# Budget: code must refuse to start or continue a paid run past these caps,
+# and must ask the user before any paid run regardless of the cap.
+# ---------------------------------------------------------------------------
+budget:
+  max_spend_usd: 0.0           # 0 = no paid API calls allowed; raise explicitly after approval
+  max_adaption_credits: 0      # 0 = no Adaption credit-spending steps allowed
+
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
+paths:
+  benchmark: data/benchmark/items.jsonl
+  turns: data/benchmark/turns.yaml
+  review_sheet: data/benchmark/review_sheet.csv
+  train: data/train/
+  train_manifest: data/train/manifest.json
+  raw_log_dir: results/raw/trajectories/   # one JSONL per model (+ second_judge, _runs): each file < GitHub's 100 MB
+  results_csv: results/raw/results.csv
+  tables: results/tables/
+  figures: results/figures/
+  second_judge_scores: results/raw/second_judge_scores.csv
+  dry_run_dir: results/dry_run/   # mock-client output; gitignored, never used for results
+
+# ---------------------------------------------------------------------------
+# Adaption intervention (src/adaption_pipeline.py). Credit-spending steps (invent, train) also need
+# budget.max_adaption_credits > 0 AND a confirmation typed by the user in an interactive terminal.
+# ---------------------------------------------------------------------------
+adaption:
+  sdk_version: "0.19.0"           # refuses to run against any other installed version
+  dataset_name: contract-format-v1
+  rows: 200
+  training_type: instruction_dataset   # prompt/completion rows (SFT). No preference pairs, no DPO.
+  domains: [medicine, software, finance, policy]
+  # Our domain -> keywords matched against the codes/titles from datasets.invent_domains().
+  domain_keywords:
+    medicine: [medic, health, clinical]
+    software: [software, programming, coding, computer, engineering]
+    finance: [financ, invest, banking]
+    policy: [policy, government, public, politic, law]
+  # Explicit codes from the live datasets.invent_domains() catalog (14 Nov 2026), which has no
+  # "software" or "policy" code. Closest matches chosen; review before `invent`. Alternatives seen:
+  # technology, corporate_business, market_analysis, legal.
+  domain_codes:
+    medicine: medical
+    software: code
+    finance: personal_finance
+    policy: governance
+  autoscientist:
+    model: null                   # null = AutoScientist chooses; the chosen model is recorded
+    augmentation_domain_rows: 0   # SDK default. Augmented rows are generated server-side and
+    augmentation_general_rows: 0  #   could not be leakage-checked, so keep these at 0.
+    max_iterations: null          # null = platform default (SDK docs: currently 3)
+    target_win_rate: null         # null = platform default
+  wait_timeout_s:
+    dataset: 3600
+    training: 1800                # per `fetch` invocation; re-run fetch to keep polling
+  leakage:                        # a training text is a near-duplicate of a benchmark text if ANY holds
+    sequence_ratio: 0.75          #   difflib ratio of normalised texts >= this
+    containment: 0.70             #   share of the benchmark text's content words found in it >= this
+    min_benchmark_words: 8        #   (containment only for benchmark texts with at least this many)
+    min_substring_chars: 40       #   or the normalised benchmark text appears verbatim (if this long)
+
+# ---------------------------------------------------------------------------
+# Analysis (src/analyze.py). Parameters only: every result is computed from results.csv.
+# ---------------------------------------------------------------------------
+analysis:
+  bootstrap_resamples: 10000
+  bootstrap_seed: 20261115
+  ci_level: 0.95
+  recovery_min_gap: 0.10        # recovery fraction only where |c1 - c2A| >= this
+  log_score_clip: 0.01          # log score only: clip P to [0.01, 0.99]; clipped counts are reported
+  cross_model_condition: default
+  min_models_cross_model: 5     # warn below this
+  human_rating_n: 30            # stratified by tier
+  sampling_seed: 20261116       # for choosing human-rating and second-judge briefings

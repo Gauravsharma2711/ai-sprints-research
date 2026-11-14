@@ -1,0 +1,5 @@
+# Same bytes on Windows and Kaggle: the harness hashes items.jsonl/turns.yaml into protocol_hash,
+# so a CRLF checkout would make resume refuse rows written on another machine.
+* text=auto eol=lf
+*.png binary
+*.zip binary

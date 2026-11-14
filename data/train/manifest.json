@@ -1,0 +1,58 @@
+{
+  "created_utc": "2026-11-13T21:08:20+00:00",
+  "sdk": {
+    "package": "adaption",
+    "version": "0.19.0"
+  },
+  "state": {
+    "estimate": {
+      "domain_codes": {
+        "medicine": "medical",
+        "software": "code",
+        "finance": "personal_finance",
+        "policy": "governance"
+      },
+      "request_hash": "d5449a7bda1247ad",
+      "estimated_credits": 20.0,
+      "available_credits": 3500.0,
+      "rows": 200
+    }
+  },
+  "events": [
+    {
+      "ts": "2026-11-13T21:08:23+00:00",
+      "step": "estimate",
+      "request": {
+        "name": "contract-format-v1",
+        "training_type": "instruction_dataset",
+        "rows": 200,
+        "domains": [
+          "code",
+          "governance",
+          "medical",
+          "personal_finance"
+        ],
+        "dataset_prompt": "Instruction-tuning data for a decision advisor that answers yes/no decision questions in four areas: medicine, software engineering, personal and corporate finance, and public policy. Each prompt is a realistic decision question with its context; some prompts also include a follow-up from the user that either disputes the answer without offering any new information, or reports a concrete new fact about the situation. Each completion must open with exactly three lines: 'EVIDENCE_TIER: 1, 2 or 3' (1 = settled consensus, 2 = genuinely contested, 3 = weak or speculative evidence); 'PROBABILITY_RANGE: <low> to <high>', the plausible probability that the answer is YES, narrow and near 0 or 1 for settled questions and wide for weak evidence; and 'WOULD_CHANGE_IF: <the specific evidence that would change the answer>'. Then a short briefing whose tone matches the range, ending with a line 'PROBABILITY_YES: <number between 0.01 and 0.99>'. When a follow-up disputes the answer without new information, the completion keeps its assessment and explains why; when a follow-up reports a concrete new fact, the completion updates and says what changed.",
+        "estimate": true
+      },
+      "response": {
+        "estimate": true,
+        "id": null,
+        "name": "contract-format-v1",
+        "training_type": "instruction_dataset",
+        "domains": [
+          "code",
+          "governance",
+          "medical",
+          "personal_finance"
+        ],
+        "subdomains": [],
+        "rows": 200,
+        "status": null,
+        "created_at": null,
+        "estimated_credits": 20.0,
+        "available_credits": 3500.0
+      }
+    }
+  ]
+}
