@@ -7,7 +7,7 @@ token is needed.
 
 | Name | What |
 |---|---|
-| `HF_TOKEN` | Hugging Face token, type Read (accept the Llama 3.1 licence on HF first) |
+| `HF_TOKEN` | Hugging Face token, type Read (accept each gated model's terms on HF first, e.g. Mistral) |
 | `GEMINI_API_KEY` | Gemini API key from Google AI Studio: the judge |
 | `GROQ_API_KEY` | optional: only for the second judge later |
 
@@ -22,9 +22,13 @@ model (e.g. earlier gpt-oss scores), so every J comes from the same judge.
 limits shown for that model. Everything else is already set. For other subject models, change only
 the `MODEL` line (table at the end).
 
-**What has been verified (14 Nov 2026, locally):** every cell ran in a real IPython kernel via
+**Status.** The author ran this runbook on Kaggle (GPU T4 x2) for three subject models:
+`qwen2.5-7b`, `phi-3.5-mini` and `mistral-7b`; their results are in `results/raw/`. `llama-3.1-8b`
+was dropped (gated model access). The notebook used is `notebooks/kaggle_run.ipynb`.
+
+**What was verified before the first Kaggle session (14 Nov 2026, locally):** every cell ran in a real IPython kernel via
 `tools/kaggle_sim/run_sim.py`, with stand-ins for what only Kaggle has (stub Kaggle secrets and torch,
-a fake OpenAI-compatible server in place of vLLM and Gemini). **Not verifiable off Kaggle:** the vLLM
+a fake OpenAI-compatible server in place of vLLM and Gemini). **Not verifiable off Kaggle** (later exercised in the real Kaggle sessions above): the vLLM
 install (Cell 5), the real GPU server and model, CUDA versions, real Gemini responses and limits.
 If a cell errors, paste the error and the last 30 lines of `/kaggle/working/vllm_server.log` to Claude.
 
@@ -45,7 +49,7 @@ PREV_DIR = "/kaggle/input/prev-results"   # earlier results_*.zip, uploaded as a
 
 # Judge (Google Gemini). Values from Google AI Studio for the model you pick.
 JUDGE_PROVIDER = "gemini"     # "gemini" (default) | "groq" | "xai"
-JUDGE_MODEL  = ""             # FILL IN: model id exactly as listed (Cell 7b prints the ids your key can use)
+JUDGE_MODEL  = ""             # FILL IN: model id exactly as listed (Cell 7b prints the ids); this study used gemini-3.1-flash-lite
 JUDGE_FAMILY = "google"       # must differ from llama/qwen/mistral/phi (the harness checks)
 JUDGE_MAX_TOKENS = 300        # room for hidden reasoning; some Gemini models cannot turn it off
 JUDGE_REASONING_EFFORT = "low"   # Gemini accepts minimal|low|medium|high; None = do not send
@@ -71,7 +75,7 @@ JUDGE_BASE_URL, JUDGE_KEY = {
     "xai":    ("https://api.x.ai/v1", "XAI_API_KEY"),
 }[JUDGE_PROVIDER]
 UNV = "--allow-unverified" if ALLOW_UNVERIFIED else ""
-LORA_PATH, LORA_NAME = None, "contract_sft"   # tuned-model session only (see the end)
+LORA_PATH, LORA_NAME = None, "contract_sft"   # unused in this study: keep None
 print("model:", MODEL, "| TP:", TP, "| quant:", QUANT, "| judge:", JUDGE_PROVIDER, JUDGE_MODEL or "(not set)")
 ```
 
@@ -373,7 +377,7 @@ Cell 1 (model, prices, rate limits):
 
 | MODEL | HF id (config.yaml) | GPUs | Note |
 |---|---|---|---|
-| `llama-3.1-8b` | meta-llama/Llama-3.1-8B-Instruct | 2 | gated: wait for Meta's approval on HF |
+| `llama-3.1-8b` | meta-llama/Llama-3.1-8B-Instruct | 2 | gated; dropped from this study (gated model access) |
 | `qwen2.5-7b` | Qwen/Qwen2.5-7B-Instruct-AWQ | 1 | AWQ 4-bit, open |
 | `mistral-7b` | mistralai/Mistral-7B-Instruct-v0.3 | 2 | accept terms on HF |
 | `phi-3.5-mini` | microsoft/Phi-3.5-mini-instruct | 1 | open |
