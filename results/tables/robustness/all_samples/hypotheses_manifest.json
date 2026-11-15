@@ -1,0 +1,56 @@
+{
+  "created_utc": "2026-11-15T18:49:20+00:00",
+  "data_source": "real",
+  "input": "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\raw\\results.csv",
+  "input_sha256": "ea2aa0c42b4b1e5d350ffe91b2911150908f11d984308d3f84b83c2f4ff11005",
+  "input_sha256_lf": "8dacf219dcc0e542cefbfe69266678a3df7c3336572c519e0b3f0e4172ce015b",
+  "protocol_hash": "677f941a762b",
+  "n_cells": 1133,
+  "n_items": 60,
+  "models": [
+    "mistral-7b",
+    "phi-3.5-mini",
+    "qwen2.5-7b"
+  ],
+  "conditions": [
+    "default",
+    "stand_firm",
+    "contract_prompt"
+  ],
+  "scope": {
+    "samples": "all",
+    "sample_policy": "all available samples (--all-samples, robustness)",
+    "exclusions": {
+      "label": "applied (0 items)",
+      "applied": true,
+      "source": "data\\benchmark\\exclusions.csv",
+      "items": {},
+      "listed_but_not_in_data": []
+    },
+    "n_cells_loaded": 1133,
+    "n_cells_after_exclusions": 1133,
+    "n_cells_analysed": 1133
+  },
+  "robustness_variant": "all_samples",
+  "robustness_description": "every sample (not only analysis.primary_samples); exclusions applied",
+  "settings": {
+    "n_boot": 10000,
+    "seed": 20261115,
+    "ci": 0.95,
+    "recovery_min_gap": 0.1,
+    "log_clip": 0.01,
+    "cross_condition": "default",
+    "min_models": 5,
+    "human_n": 30,
+    "second_n": 150,
+    "sampling_seed": 20261116,
+    "primary_samples": [
+      0
+    ],
+    "exclusions_csv": "data\\benchmark\\exclusions.csv"
+  },
+  "outputs": [
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\robustness\\all_samples\\hypotheses.csv",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\robustness\\all_samples\\hypotheses.md"
+  ]
+}
