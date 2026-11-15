@@ -31,7 +31,20 @@ METRICS = (
     "bluff_shift", "neutral_shift_T2N", "net_bluff_shift", "evidence_update", "selectivity",
     "selectivity_ratio", "hysteresis_signed", "hysteresis_abs", "control_T3N_abs",
     "excess_hysteresis_abs", "recovery_fraction", "ablation_T3a_minus_T3", "ablation_T3b_minus_T3",
-    "ablation_T3c_minus_T3", "brier_T1", "brier_T3", "log_score_T1", "log_score_T3",
+    "ablation_T3c_minus_T3", "brier_T1", "brier_T3", "brier_T3_minus_T1", "log_score_T1", "log_score_T3",
+)
+# (hypothesis, comparison, metric, tier) rows, as in src/analyze.py's hypotheses table.
+HYPOTHESES = (
+    ("H1", "default", "extremity_gap", "3"),
+    ("H2", "default", "net_bluff_shift", "all"),
+    ("H3", "stand_firm - default", "bluff_shift", "all"),
+    ("H3", "stand_firm - default", "evidence_update", "all"),
+    ("H4", "default", "excess_hysteresis_abs", "all"),
+    ("H5", "default", "ablation_T3a_minus_T3", "all"),
+    ("H5", "default", "ablation_T3b_minus_T3", "all"),
+    ("H5", "default", "ablation_T3c_minus_T3", "all"),
+    ("H6", "contract_prompt - default", "selectivity", "all"),
+    ("H6", "contract_prompt - default", "excess_hysteresis_abs", "all"),
 )
 ARMS = ("T1", "probe", "judge", "T2A", "T2B", "T2N", "T3", "T3a", "T3b", "T3c", "T3N")
 
@@ -85,17 +98,18 @@ def synthetic_tables(root: Path) -> tuple[Path, Path]:
             for tier in TIERS:
                 for metric in ("bluff_shift", "net_bluff_shift", "evidence_update", "selectivity",
                                "hysteresis_abs", "excess_hysteresis_abs", "brier_T1"):
-                    rows.append([subject, f"{cond} - default", tier, metric, *est(), 60])
+                    rows.append([subject, f"{cond} - default", tier, metric, *est(), 60, 60, 120])
     write_csv(tables / "condition_contrasts.csv", ["subject", "contrast", "tier", "metric", "estimate", "ci_low",
-                                                   "ci_high", "n_paired_items"], rows)
+                                                   "ci_high", "n_items", "n_paired_items", "n_cells"], rows)
     rows = []
     for subject in (*SUBJECTS, "ALL_MODELS"):
-        for cond in CONDITIONS:
+        for cond in (*CONDITIONS, "all"):
             for arm in ARMS:
-                n_nan = rng.randint(0, 9)
-                rows.append([subject, cond, arm, 180, 180 - n_nan, 0, n_nan, n_nan / 180])
+                n_nan, n_reask = rng.randint(0, 9), rng.randint(0, 9)
+                rows.append([subject, cond, arm, 180, 180 - n_nan - n_reask, n_reask, n_nan, n_nan / 180,
+                             n_reask / 180])
     write_csv(tables / "data_quality.csv", ["subject", "condition", "arm", "n_cells", "n_ok", "n_reask_ok",
-                                            "n_nan", "nan_rate"], rows)
+                                            "n_nan", "nan_rate", "reask_ok_rate"], rows)
     rows = []
     for subject, samples in (("qwen2.5-7b", 3), ("phi-3.5-mini", 3), ("mistral-7b", 1)):
         for cond in CONDITIONS:
@@ -103,12 +117,26 @@ def synthetic_tables(root: Path) -> tuple[Path, Path]:
                 n = 33 if (subject == "phi-3.5-mini" and cond == "contract_prompt") else 60
                 rows.append([subject, cond, sample, n, n, n if sample == 0 else 0])
     write_csv(tables / "coverage.csv", ["subject", "condition", "sample", "n_items", "n_cells", "n_judged"], rows)
-    rows = [[f"H{i}", f"synthetic hypothesis {i}", "ALL_MODELS", "default", "bluff_shift", "all", "+", *est(),
-             60, 180, "supported", "sample 0", ""] for i in range(1, 7)]
-    write_csv(tables / "hypotheses.csv", ["hypothesis", "description", "subject", "comparison", "metric", "tier",
-                                          "predicted_sign", "estimate", "ci_low", "ci_high", "n_items", "n_cells",
-                                          "verdict", "samples", "exclusions"], rows)
+    hyp_header = ["hypothesis", "description", "subject", "comparison", "metric", "tier", "predicted_sign",
+                  "estimate", "ci_low", "ci_high", "n_items", "n_cells", "verdict", "samples", "exclusions"]
+
+    def hypotheses() -> list[list[object]]:
+        return [[h, f"synthetic {h}", subject, comp, metric, tier, ">0", *est(), 60, 180, "supported", "0",
+                 "applied (0 items)"] for h, comp, metric, tier in HYPOTHESES for subject in (*SUBJECTS, "ALL_MODELS")]
+    write_csv(tables / "hypotheses.csv", hyp_header, hypotheses())
+    write_csv(tables / "per_tier.csv",
+              ["subject", "condition", "metric", "tier", "estimate", "ci_low", "ci_high", "n_items", "n_cells",
+               "samples", "exclusions"],
+              [[subject, cond, metric, tier, *est(), 20, 60, "0", "applied (0 items)"]
+               for subject in (*SUBJECTS, "ALL_MODELS") for cond in CONDITIONS for metric in METRICS
+               for tier in TIERS[1:]])
+    for variant in ("all_samples", "no_exclusions"):
+        sub = tables / "robustness" / variant
+        sub.mkdir(parents=True)
+        write_csv(sub / "hypotheses.csv", hyp_header, hypotheses())
+        (sub / "coverage.csv").write_bytes((tables / "coverage.csv").read_bytes())
     tiny_png(figures / "summary_ALL_MODELS.png")
+    tiny_png(figures / "hypotheses_forest.png")
     return tables, figures
 
 
@@ -256,6 +284,25 @@ def test_table_and_pivot_render_in_filter_order(tmp_path: Path) -> None:
     assert lines[2].startswith("| stand_firm |")  # filter order, not file order
     assert "| evidence_update | 0.31 [0.25, 0.37] | 0.21 [n/a, n/a] |" in lines
     assert "| bluff_shift | 0.12 [0.10, 0.15] | 0.07 [0.04, 0.09] |" in lines
+
+
+def test_table_names_with_subdirectories(tmp_path: Path) -> None:
+    tables, figures = small_tables(tmp_path / "in")
+    sub = tables / "robustness" / "all_samples"
+    sub.mkdir(parents=True)
+    write_csv(sub / "metrics.csv", ["data_source", "subject", "condition", "tier", "metric", "estimate", "ci_low",
+                                    "ci_high", "n_items"],
+              [["real", "ALL_MODELS", "default", "all", "bluff_shift", 0.4321, 0.4, 0.46, 60]])
+    draft = tmp_path / "d.md"
+    draft.write_text("{{defaults:metrics:condition=stand_firm}}\n"
+                     "{{num:robustness/all_samples/metrics:subject=ALL_MODELS;metric=bluff_shift:estimate:.3f}} "
+                     "{{ci:robustness/all_samples/metrics:subject=ALL_MODELS;metric=bluff_shift:.2f}}\n",
+                     encoding="utf-8")
+    ctx = make_ctx(tables, figures, tmp_path / "o", tmp_path)
+    assert bp.build(ctx, draft, docx=False) == []
+    # the main table's defaults do not leak into the robustness table of the same base name
+    assert "0.432 [0.40, 0.46]" in (tmp_path / "o" / "paper.md").read_text(encoding="utf-8")
+    assert all(u.source_file.endswith("robustness/all_samples/metrics.csv") for u in ctx.used)
 
 
 def test_pivot_ambiguous_cell_errors(tmp_path: Path) -> None:
