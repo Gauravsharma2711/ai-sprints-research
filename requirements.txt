@@ -8,4 +8,5 @@ python-dotenv>=1.0
 pytest>=8.0
 tenacity>=8.2
 pyyaml>=6.0
-adaption==0.19.0   # sponsor SDK; pinned: src/adaption_pipeline.py was written against this version's types
+python-docx>=1.1   # tools/build_paper.py: paper.docx for pasting into the template
+pypdf>=4.0         # tools/numbers_audit.py: audit numbers in the exported PDF

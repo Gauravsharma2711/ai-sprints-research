@@ -2,7 +2,7 @@
 
 > Status: scaffold only. No experiments have been run and there are no results yet.
 
-Submission to the AI x Epistemics Research Sprint (Apart Research, supported by Adaption),
+Submission to the AI x Epistemics Research Sprint (Apart Research),
 13 to 15 November 2026, Track 1: Model Epistemics & Decision-Making Evals.
 
 ## Question
@@ -24,11 +24,9 @@ _None yet. Every number here will be generated from `results/raw/` by scripts in
 | `src/benchmark.py` (schema, validator, review-sheet export), `tests/test_benchmark.py` | Sprint (Sat 14 Nov 2026) | |
 | `src/harness.py`, `src/prompts.py`, `src/parsing.py`, `src/clients.py`, `tests/test_harness.py` | Sprint (Sat 14 Nov 2026) | Harness written by Claude; only dry-run (mock client) tested so far. Prompt wording in `prompts.py` is a draft adapted from the playbook's section 12 templates. |
 | `src/analyze.py`, `src/second_judge.py`, `tests/test_analyze.py` | Sprint (Sat 14 Nov 2026) | Analysis, judge validation and second-judge runner written by Claude; tested on dry-run (mock) output only. |
-| `src/adaption_pipeline.py`, `tests/test_adaption_pipeline.py` | Sprint (Sat 14 Nov 2026) | Written by Claude against the installed `adaption==0.19.0` SDK (not the playbook's unverified calls). Only `estimate` has been run. |
 | Judge choice | Sprint (Sat 14 Nov 2026) | The playbook planned xAI Grok as judge. During the sprint the judge was changed to Google Gemini (OpenAI-compatible endpoint, free tier) after Groq's free-tier daily token limit proved too small. `--judge-only` re-judges any cell scored by another model, so all reported J values come from one Gemini model. |
 | `docs/kaggle_runbook.md` | Sprint (Sat 14 Nov 2026) | Kaggle notebook cells drafted by the user, revised by Claude to match the code. Not yet run on Kaggle. |
 | `data/benchmark/items.jsonl` (60 items), `turns.yaml`, `review_sheet.csv` | Sprint (Sat 14 Nov 2026) | **Drafted by Claude; not yet reviewed or verified by humans.** |
-| `data/train/` intervention data | Sprint | Not started |
 | `results/` | Sprint | Not started |
 | `tests/` | Sprint | Not started |
 
@@ -53,7 +51,6 @@ _To be written once the harness exists._
 ```
 src/              experiment code
 data/benchmark/   benchmark items and fixed user turns
-data/train/       Adaption intervention training data
 results/raw/      trajectories/<model>.jsonl (every model call, one file per model), results.csv
 results/tables/   generated tables
 results/figures/  generated figures

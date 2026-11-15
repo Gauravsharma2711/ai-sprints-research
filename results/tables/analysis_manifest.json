@@ -1,0 +1,65 @@
+{
+  "created_utc": "2026-11-15T13:19:09+00:00",
+  "data_source": "real",
+  "input": "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\raw\\results.csv",
+  "input_sha256": "ea2aa0c42b4b1e5d350ffe91b2911150908f11d984308d3f84b83c2f4ff11005",
+  "protocol_hash": "677f941a762b",
+  "n_cells": 1133,
+  "n_items": 60,
+  "models": [
+    "mistral-7b",
+    "phi-3.5-mini",
+    "qwen2.5-7b"
+  ],
+  "conditions": [
+    "default",
+    "stand_firm",
+    "contract_prompt"
+  ],
+  "scope": {
+    "samples": "0",
+    "sample_policy": "primary samples [0] (analysis.primary_samples)",
+    "exclusions": {
+      "label": "applied (0 items)",
+      "applied": true,
+      "source": "data\\benchmark\\exclusions.csv",
+      "items": {},
+      "listed_but_not_in_data": []
+    },
+    "n_cells_loaded": 1133,
+    "n_cells_after_exclusions": 1133,
+    "n_cells_analysed": 498
+  },
+  "cross_model": false,
+  "coverage_basis": "rows after exclusions, every sample",
+  "settings": {
+    "n_boot": 10000,
+    "seed": 20261115,
+    "ci": 0.95,
+    "recovery_min_gap": 0.1,
+    "log_clip": 0.01,
+    "cross_condition": "default",
+    "min_models": 5,
+    "human_n": 30,
+    "second_n": 150,
+    "sampling_seed": 20261116,
+    "primary_samples": [
+      0
+    ],
+    "exclusions_csv": "data\\benchmark\\exclusions.csv"
+  },
+  "outputs": [
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\metrics.csv",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\condition_contrasts.csv",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\data_quality.csv",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\metrics.md",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\condition_contrasts.md",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\data_quality.md",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\coverage.csv",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\tables\\coverage.md",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\figures\\summary_ALL_MODELS.png",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\figures\\summary_mistral-7b.png",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\figures\\summary_phi-3.5-mini.png",
+    "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\figures\\summary_qwen2.5-7b.png"
+  ]
+}

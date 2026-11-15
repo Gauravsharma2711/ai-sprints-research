@@ -378,10 +378,3 @@ Cell 1 (model, prices, rate limits):
 | `mistral-7b` | mistralai/Mistral-7B-Instruct-v0.3 | 2 | accept terms on HF |
 | `phi-3.5-mini` | microsoft/Phi-3.5-mini-instruct | 1 | open |
 
-## Tuned model (later, after `python -m src.adaption_pipeline fetch`)
-
-Not ready to paste yet. It needs: the base model AutoScientist chose (recorded in
-`data/train/manifest.json`) run as an ordinary subject; a check that the downloaded checkpoint
-is a LoRA adapter vLLM can load (the SDK only calls it "best trained model artifact"); and a
-`contract-sft` subject in `config.yaml` whose `hf_id` is `contract_sft`. Ask Claude to prepare
-that session when the checkpoint exists.

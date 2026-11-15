@@ -46,7 +46,6 @@ subjects:
     tensor_parallel: 1
     confirmed: false
 
-  # Adaption-tuned model and its base: add once AutoScientist selects a base (plan section 8).
 
 # ---------------------------------------------------------------------------
 # Judges (must be a different family from every subject; enforced in code)
@@ -78,10 +77,10 @@ second_judge:
   provider: groq
   base_url: https://api.groq.com/openai/v1
   api_key_env: GROQ_API_KEY
-  model: null                  # FILL IN; record its family and check it differs from all subjects
-  family: null
+  model: openai/gpt-oss-120b   # free tier; differs from the primary judge (Gemini) and every subject
+  family: openai
   temperature: 0.0
-  max_tokens: 20
+  max_tokens: 300              # reasoning model: needs room for hidden reasoning (a Groq test call used ~80)
   n_briefings: 150             # stratified by model x tier
   # Self-imposed caps. Set these at or below the limits shown in the Groq console for the chosen model.
   rate_limits:
@@ -117,7 +116,6 @@ retries:
 # ---------------------------------------------------------------------------
 budget:
   max_spend_usd: 0.0           # 0 = no paid API calls allowed; raise explicitly after approval
-  max_adaption_credits: 0      # 0 = no Adaption credit-spending steps allowed
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -126,53 +124,12 @@ paths:
   benchmark: data/benchmark/items.jsonl
   turns: data/benchmark/turns.yaml
   review_sheet: data/benchmark/review_sheet.csv
-  train: data/train/
-  train_manifest: data/train/manifest.json
   raw_log_dir: results/raw/trajectories/   # one JSONL per model (+ second_judge, _runs): each file < GitHub's 100 MB
   results_csv: results/raw/results.csv
   tables: results/tables/
   figures: results/figures/
   second_judge_scores: results/raw/second_judge_scores.csv
   dry_run_dir: results/dry_run/   # mock-client output; gitignored, never used for results
-
-# ---------------------------------------------------------------------------
-# Adaption intervention (src/adaption_pipeline.py). Credit-spending steps (invent, train) also need
-# budget.max_adaption_credits > 0 AND a confirmation typed by the user in an interactive terminal.
-# ---------------------------------------------------------------------------
-adaption:
-  sdk_version: "0.19.0"           # refuses to run against any other installed version
-  dataset_name: contract-format-v1
-  rows: 200
-  training_type: instruction_dataset   # prompt/completion rows (SFT). No preference pairs, no DPO.
-  domains: [medicine, software, finance, policy]
-  # Our domain -> keywords matched against the codes/titles from datasets.invent_domains().
-  domain_keywords:
-    medicine: [medic, health, clinical]
-    software: [software, programming, coding, computer, engineering]
-    finance: [financ, invest, banking]
-    policy: [policy, government, public, politic, law]
-  # Explicit codes from the live datasets.invent_domains() catalog (14 Nov 2026), which has no
-  # "software" or "policy" code. Closest matches chosen; review before `invent`. Alternatives seen:
-  # technology, corporate_business, market_analysis, legal.
-  domain_codes:
-    medicine: medical
-    software: code
-    finance: personal_finance
-    policy: governance
-  autoscientist:
-    model: null                   # null = AutoScientist chooses; the chosen model is recorded
-    augmentation_domain_rows: 0   # SDK default. Augmented rows are generated server-side and
-    augmentation_general_rows: 0  #   could not be leakage-checked, so keep these at 0.
-    max_iterations: null          # null = platform default (SDK docs: currently 3)
-    target_win_rate: null         # null = platform default
-  wait_timeout_s:
-    dataset: 3600
-    training: 1800                # per `fetch` invocation; re-run fetch to keep polling
-  leakage:                        # a training text is a near-duplicate of a benchmark text if ANY holds
-    sequence_ratio: 0.75          #   difflib ratio of normalised texts >= this
-    containment: 0.70             #   share of the benchmark text's content words found in it >= this
-    min_benchmark_words: 8        #   (containment only for benchmark texts with at least this many)
-    min_substring_chars: 40       #   or the normalised benchmark text appears verbatim (if this long)
 
 # ---------------------------------------------------------------------------
 # Analysis (src/analyze.py). Parameters only: every result is computed from results.csv.
@@ -183,7 +140,11 @@ analysis:
   ci_level: 0.95
   recovery_min_gap: 0.10        # recovery fraction only where |c1 - c2A| >= this
   log_score_clip: 0.01          # log score only: clip P to [0.01, 0.99]; clipped counts are reported
+  primary_samples: [0]          # primary analysis uses only these samples so every model is compared
+                                #   on the same footing; `--all-samples` = robustness run on every sample
+  exclusions_csv: data/benchmark/exclusions.csv   # item_id,reason (header only = none); applied by
+                                #   default, `--no-exclusions` = robustness run. Edited by people only.
   cross_model_condition: default
-  min_models_cross_model: 5     # warn below this
+  min_models_cross_model: 5     # warn below this; cross-model outputs only with --cross-model
   human_rating_n: 30            # stratified by tier
   sampling_seed: 20261116       # for choosing human-rating and second-judge briefings

@@ -1,16 +1,29 @@
 """Analysis. Every number comes from results.csv; briefing text comes from the raw JSONL log.
 
 Commands (add --dry-run to read the mock-client output in results/dry_run/ instead):
-    python -m src.analyze metrics                     # tables + figures
-    python -m src.analyze export-human-sheet          # 30 blind briefings for two raters
-    python -m src.analyze human-agreement             # once the ratings are filled in
+    python -m src.analyze metrics                     # tables + figures (primary samples)
+    python -m src.analyze metrics --all-samples --out-dir <dir>   # robustness: every sample
+    python -m src.analyze hypotheses                  # H1-H6 table with verdicts from the item CIs
+    python -m src.analyze annotation-agreement        # review_sheet a_* labels vs drafted labels
+    python -m src.analyze export-human-sheet          # 30 blind briefings for the raters
+    python -m src.analyze human-agreement             # once the ratings are filled in (1 or 2 raters)
     python -m src.analyze export-second-judge-sample  # 150 briefings for the second judge
     python -m src.analyze compare-judges              # after `python -m src.second_judge`
+Flags: --all-samples (robustness), --no-exclusions (robustness), --cross-model (only with >= a few
+models; off by default).
 
 Conventions (docs/playbook_preexisting.md section 4 and 9):
-- The bootstrap resamples benchmark ITEMS. Within an item, samples (and, for the pooled
-  ALL_MODELS rows, models) are averaged first, so every item has equal weight.
+- Sample policy: the primary analysis uses only `analysis.primary_samples` (default [0]) so every
+  model is compared on the same footing; `--all-samples` uses every sample. Every table has a
+  `samples` column and an `exclusions` column; the manifest records both.
+- Exclusions: items listed in `analysis.exclusions_csv` (item_id,reason) are dropped by default.
+- The bootstrap resamples benchmark ITEMS. Within an item, samples are averaged within each model
+  first, then models are averaged (pooled ALL_MODELS rows), so every item has equal weight and
+  a model with more samples does not dominate an item.
+- Condition contrasts are paired by item within each model (only (model, item) pairs present in
+  both conditions), then averaged over models per item.
 - Paired metrics (differences, ratios) use only cells where both inputs are non-NaN.
+- Judge-based metrics use judged rows only (a pending or failed judge gives NaN J, which drops out).
 - Ratios are ratios of means. Per-item ratios are never averaged.
 - Recovery fraction is sign-aligned so cells pushed up and pushed down add up:
   sum over cells of (c3 - c2A) * sign(c1 - c2A), divided by sum of |c1 - c2A|, using only
@@ -44,6 +57,7 @@ from matplotlib.lines import Line2D  # noqa: E402
 from scipy import stats  # noqa: E402
 
 from src import prompts  # noqa: E402
+from src.benchmark import ANNOTATOR_COLUMNS, load_items  # noqa: E402
 from src.harness import (  # noqa: E402
     ALL_ARMS,
     RESULT_COLUMNS,
@@ -87,6 +101,17 @@ class Settings:
     human_n: int
     second_n: int
     sampling_seed: int
+    primary_samples: tuple[int, ...] = (0,)
+    exclusions_csv: str = ""  # resolved path; "" = no exclusions file configured
+
+
+def _primary_samples(value: Any) -> tuple[int, ...]:
+    if value is None:
+        return (0,)
+    if (not isinstance(value, list) or not value
+            or not all(isinstance(v, int) and not isinstance(v, bool) and v >= 0 for v in value)):
+        raise ConfigError(f"analysis.primary_samples must be a non-empty list of sample indices, got {value!r}")
+    return tuple(sorted(set(value)))
 
 
 def load_settings(config_path: Path) -> tuple[HarnessConfig, Settings]:
@@ -94,6 +119,9 @@ def load_settings(config_path: Path) -> tuple[HarnessConfig, Settings]:
     raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
     try:
         a = raw["analysis"]
+        excl = a.get("exclusions_csv")
+        excl_path = "" if not excl else str(Path(excl) if Path(excl).is_absolute()
+                                             else config_path.parent / excl)
         settings = Settings(
             n_boot=int(a["bootstrap_resamples"]),
             seed=int(a["bootstrap_seed"]),
@@ -105,6 +133,8 @@ def load_settings(config_path: Path) -> tuple[HarnessConfig, Settings]:
             human_n=int(a["human_rating_n"]),
             second_n=int(raw["second_judge"]["n_briefings"]),
             sampling_seed=int(a["sampling_seed"]),
+            primary_samples=_primary_samples(a.get("primary_samples")),
+            exclusions_csv=excl_path,
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise ConfigError(f"{config_path}: missing or invalid analysis setting: {exc!r}") from exc
@@ -186,6 +216,109 @@ def load_results(path: Path, *, dry_run: bool) -> pd.DataFrame:
 def conditions_in(df: pd.DataFrame) -> list[str]:
     present = set(df["condition"].unique())
     return [c for c in prompts.CONDITIONS if c in present] + sorted(present - set(prompts.CONDITIONS))
+
+
+# ---------------------------------------------------------------------------
+# Analysis scope: exclusions and sample policy
+# ---------------------------------------------------------------------------
+
+EXCLUSION_COLUMNS: tuple[str, ...] = ("item_id", "reason")
+
+
+def load_exclusions(path: str) -> tuple[dict[str, str], str]:
+    """Items to exclude, from a CSV with header item_id,reason. A header-only file means no
+    exclusions. Returns (item_id -> reason, a note on where they came from)."""
+    if not path:
+        return {}, "no exclusions file configured"
+    p = Path(path)
+    if not p.exists():
+        return {}, f"{p} not found: no exclusions"
+    table = pd.read_csv(p, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    if tuple(c.strip() for c in table.columns) != EXCLUSION_COLUMNS:
+        raise ConfigError(f"{p} must have exactly the header {','.join(EXCLUSION_COLUMNS)} "
+                          f"(got {list(table.columns)})")
+    table.columns = list(EXCLUSION_COLUMNS)
+    out: dict[str, str] = {}
+    problems: list[str] = []
+    for k, row in enumerate(table.itertuples(index=False), start=2):
+        item_id, reason = str(row.item_id).strip(), str(row.reason).strip()
+        if not item_id and not reason:
+            continue
+        if not item_id or not reason:
+            problems.append(f"line {k}: every exclusion needs an item_id and a reason")
+        elif item_id in out:
+            problems.append(f"line {k}: {item_id} listed twice")
+        else:
+            out[item_id] = reason
+    if problems:
+        raise ConfigError(f"{p}: " + "; ".join(problems))
+    return out, str(p)
+
+
+@dataclass(frozen=True)
+class Scope:
+    """Which rows the analysis uses. `samples` and `exclusions` are the labels written into every
+    table; the rest goes into the manifest."""
+
+    samples: str                       # "0", "0,1" or "all"
+    sample_filter: tuple[int, ...] | None
+    exclusions: str                    # table label
+    exclusions_applied: bool
+    exclusions_source: str
+    excluded: dict[str, str]           # item_id -> reason, as listed in the file
+    unknown_excluded: tuple[str, ...]  # listed but absent from the data
+    n_cells_loaded: int
+    n_cells_after_exclusions: int
+    n_cells_analysed: int
+
+    def manifest(self) -> dict[str, Any]:
+        return {
+            "samples": self.samples,
+            "sample_policy": ("all available samples (--all-samples, robustness)" if self.sample_filter is None
+                              else f"primary samples {list(self.sample_filter)} (analysis.primary_samples)"),
+            "exclusions": {"label": self.exclusions, "applied": self.exclusions_applied,
+                           "source": self.exclusions_source, "items": self.excluded,
+                           "listed_but_not_in_data": list(self.unknown_excluded)},
+            "n_cells_loaded": self.n_cells_loaded,
+            "n_cells_after_exclusions": self.n_cells_after_exclusions,
+            "n_cells_analysed": self.n_cells_analysed,
+        }
+
+
+def apply_exclusions(df: pd.DataFrame, s: Settings, *, use: bool
+                     ) -> tuple[pd.DataFrame, dict[str, str], str, tuple[str, ...]]:
+    excluded, source = load_exclusions(s.exclusions_csv)
+    unknown = tuple(sorted(set(excluded) - set(df["item_id"])))
+    if unknown:
+        print(f"  WARNING: exclusions list items not in the data: {list(unknown)}")
+    out = df[~df["item_id"].isin(set(excluded))] if use and excluded else df
+    return out, excluded, source, unknown
+
+
+def apply_samples(df: pd.DataFrame, s: Settings, *, all_samples: bool) -> tuple[pd.DataFrame, str]:
+    if all_samples:
+        return df, "all"
+    out = df[df["sample"].isin(s.primary_samples)]
+    for subject in sorted(set(df["subject"]) - set(out["subject"])):
+        print(f"  WARNING: {subject} has no rows in primary samples {list(s.primary_samples)}; "
+              "it drops out of the primary analysis")
+    return out, ",".join(str(v) for v in s.primary_samples)
+
+
+def apply_scope(df: pd.DataFrame, s: Settings, *, all_samples: bool, use_exclusions: bool
+                ) -> tuple[pd.DataFrame, pd.DataFrame, Scope]:
+    """Returns (rows after exclusions, rows analysed, scope)."""
+    after_excl, excluded, source, unknown = apply_exclusions(df, s, use=use_exclusions)
+    analysed, samples = apply_samples(after_excl, s, all_samples=all_samples)
+    n_listed = len(excluded)
+    label = (f"applied ({n_listed} items)" if use_exclusions
+             else f"not applied (--no-exclusions; {n_listed} listed)")
+    scope = Scope(samples=samples, sample_filter=None if all_samples else s.primary_samples,
+                  exclusions=label, exclusions_applied=use_exclusions, exclusions_source=source,
+                  excluded=excluded, unknown_excluded=unknown, n_cells_loaded=len(df),
+                  n_cells_after_exclusions=len(after_excl), n_cells_analysed=len(analysed))
+    print(f"  scope: samples={samples}; exclusions {label}; {len(analysed)} of {len(df)} cells analysed")
+    return after_excl, analysed, scope
 
 
 # ---------------------------------------------------------------------------
@@ -285,15 +418,36 @@ CROSS_METRICS: tuple[str, ...] = (
 # ---------------------------------------------------------------------------
 
 
+def _inputs(m: Metric) -> list[str]:
+    return [m.a] if m.kind == "mean" else [m.a, str(m.b)]
+
+
+def _subject_item_cells(d: pd.DataFrame, m: Metric) -> pd.DataFrame:
+    """One row per (subject, item_id): mean of each metric input over usable cells (all inputs
+    non-NaN) and the number of such cells (`n`)."""
+    cols = _inputs(m)
+    sub = d.loc[d[cols].notna().all(axis=1), ["subject", "item_id", *cols]]
+    if sub.empty:
+        return pd.DataFrame(columns=[*cols, "n"],
+                            index=pd.MultiIndex.from_arrays([[], []], names=["subject", "item_id"]))
+    g = sub.groupby(["subject", "item_id"])
+    out = g[cols].mean()
+    out["n"] = g.size()
+    return out
+
+
 def item_arrays(d: pd.DataFrame, m: Metric) -> tuple[np.ndarray, np.ndarray | None, int]:
-    """Per-item means (equal item weights). Returns (a, b, n_cells used)."""
-    if m.kind == "mean":
-        sub = d.loc[d[m.a].notna(), ["item_id", m.a]]
-        return sub.groupby("item_id")[m.a].mean().to_numpy(dtype=float), None, len(sub)
-    assert m.b is not None
-    sub = d.loc[d[m.a].notna() & d[m.b].notna(), ["item_id", m.a, m.b]]
-    g = sub.groupby("item_id")[[m.a, m.b]].mean()
-    return g[m.a].to_numpy(dtype=float), g[m.b].to_numpy(dtype=float), len(sub)
+    """Per-item means (equal item weights; within an item, samples are averaged per model first,
+    then models are averaged). Returns (a, b, n_cells used)."""
+    si = _subject_item_cells(d, m)
+    n_cells = int(si["n"].sum())
+    if si.empty:
+        empty = np.array([], dtype=float)
+        return empty, (None if m.kind == "mean" else empty), 0
+    by_item = si.groupby(level="item_id")[_inputs(m)].mean()
+    a = by_item[m.a].to_numpy(dtype=float)
+    b = None if m.kind == "mean" else by_item[str(m.b)].to_numpy(dtype=float)
+    return a, b, n_cells
 
 
 def _combine(kind: Kind, am: np.ndarray | float, bm: np.ndarray | float | None) -> Any:
@@ -332,6 +486,13 @@ def _subject_slices(d: pd.DataFrame) -> list[tuple[str, pd.DataFrame]]:
     return [(s, d[d["subject"] == s]) for s in sorted(d["subject"].unique())] + [(POOLED, d)]
 
 
+def metric_estimate(d: pd.DataFrame, m: Metric, s: Settings) -> tuple[float, float, float, int, int]:
+    """(estimate, ci_low, ci_high, n_items, n_cells) for one metric on one slice."""
+    a, b, n_cells = item_arrays(d, m)
+    est, lo, hi = bootstrap(m.kind, a, b, n_boot=s.n_boot, seed=s.seed, ci=s.ci)
+    return est, lo, hi, len(a), n_cells
+
+
 def compute_metrics(d: pd.DataFrame, s: Settings) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for subject, ds in _subject_slices(d):
@@ -353,15 +514,42 @@ def compute_metrics(d: pd.DataFrame, s: Settings) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _subject_item_values(d: pd.DataFrame, m: Metric) -> pd.DataFrame:
+    """Per (subject, item_id): the metric's value (mean, or paired difference of means) and `n` cells."""
+    if m.kind == "ratio":
+        raise ValueError(f"no per-item value for ratio metric {m.name}")
+    si = _subject_item_cells(d, m)
+    value = si[m.a] if m.kind == "mean" else si[m.a] - si[str(m.b)]
+    return pd.DataFrame({"value": value.astype(float), "n": si["n"]}, index=si.index)
+
+
 def item_values(d: pd.DataFrame, m: Metric) -> pd.Series:
-    """One value per item for paired comparisons across conditions (mean and diff metrics)."""
-    if m.kind == "mean":
-        return d.loc[d[m.a].notna()].groupby("item_id")[m.a].mean()
-    if m.kind == "diff":
-        assert m.b is not None
-        sub = d.loc[d[m.a].notna() & d[m.b].notna()]
-        return (sub[m.a] - sub[m.b]).groupby(sub["item_id"]).mean()
-    raise ValueError(f"no per-item value for ratio metric {m.name}")
+    """One value per item (models averaged within the item) for mean and diff metrics."""
+    v = _subject_item_values(d, m)
+    if v.empty:
+        return pd.Series(dtype=float)
+    return v["value"].groupby(level="item_id").mean()
+
+
+def paired_contrast(base_d: pd.DataFrame, other_d: pd.DataFrame, m: Metric) -> tuple[np.ndarray, int]:
+    """Per-item (other - base) differences, paired by item within each model: only (model, item)
+    pairs present in both conditions count; then models are averaged per item. Returns
+    (per-item differences, n_cells used across both conditions)."""
+    vo, vb = _subject_item_values(other_d, m), _subject_item_values(base_d, m)
+    joined = vo.add_suffix("_other").join(vb.add_suffix("_base"), how="inner")
+    if joined.empty:
+        return np.array([], dtype=float), 0
+    diff = (joined["value_other"] - joined["value_base"]).groupby(level="item_id").mean()
+    return diff.to_numpy(dtype=float), int(joined["n_other"].sum() + joined["n_base"].sum())
+
+
+def contrast_estimate(ds: pd.DataFrame, cond: str, baseline: str, tier: str, m: Metric,
+                      s: Settings) -> tuple[float, float, float, int, int]:
+    base_d = _tier_slice(ds[ds["condition"] == baseline], tier)
+    other_d = _tier_slice(ds[ds["condition"] == cond], tier)
+    diff, n_cells = paired_contrast(base_d, other_d, m)
+    est, lo, hi = bootstrap("mean", diff, None, n_boot=s.n_boot, seed=s.seed, ci=s.ci)
+    return est, lo, hi, len(diff), n_cells
 
 
 def compute_contrasts(d: pd.DataFrame, s: Settings, baseline: str = "default") -> pd.DataFrame:
@@ -372,47 +560,160 @@ def compute_contrasts(d: pd.DataFrame, s: Settings, baseline: str = "default") -
     for subject, ds in _subject_slices(d):
         for cond in conds:
             for tier in TIERS:
-                base_d = _tier_slice(ds[ds["condition"] == baseline], tier)
-                other_d = _tier_slice(ds[ds["condition"] == cond], tier)
                 for name in CONTRAST_METRICS:
-                    m = METRIC_BY_NAME[name]
-                    paired = pd.concat([item_values(other_d, m), item_values(base_d, m)], axis=1,
-                                       keys=["other", "base"]).dropna()
-                    diff = (paired["other"] - paired["base"]).to_numpy(dtype=float)
-                    est, lo, hi = bootstrap("mean", diff, None, n_boot=s.n_boot, seed=s.seed, ci=s.ci)
+                    est, lo, hi, n_items, n_cells = contrast_estimate(ds, cond, baseline, tier,
+                                                                      METRIC_BY_NAME[name], s)
                     rows.append({
                         "subject": subject, "contrast": f"{cond} - {baseline}", "tier": tier,
                         "metric": name, "estimate": est, "ci_low": lo, "ci_high": hi,
-                        "n_paired_items": len(diff),
+                        "n_items": n_items, "n_paired_items": n_items, "n_cells": n_cells,
                     })
     return pd.DataFrame(rows)
 
 
 def data_quality(df: pd.DataFrame, s: Settings) -> pd.DataFrame:
+    """Per model (and pooled) x condition x arm, plus condition 'all' rows (per model x arm).
+    ok_rate, reask_ok_rate, nan_rate_attempted and the first-attempt parse-failure rate are over
+    attempted cells (status not 'pending', i.e. excluding cells whose judge has not run yet);
+    nan_rate keeps its original definition (share of NaN values over all cells)."""
     rows: list[dict[str, Any]] = []
     for subject, ds in _subject_slices(df):
-        for cond in conditions_in(df):
-            dc = ds[ds["condition"] == cond]
+        for cond in [*conditions_in(df), "all"]:
+            dc = ds if cond == "all" else ds[ds["condition"] == cond]
             n = len(dc)
             for arm in ALL_ARMS:
                 status = dc[f"status_{arm}"].astype(str)
                 values = dc[VALUE_COLUMN[arm]]
                 counts = status.value_counts().to_dict()
                 n_nan_status = int(status.str.startswith("nan").sum())
+                n_pending = int(counts.get("pending", 0))
+                attempted = n - n_pending
+                n_ok, n_reask = int(counts.get("ok", 0)), int(counts.get("reask_ok", 0))
                 first_parse_fail = (int(counts.get("reask_ok", 0) + counts.get("nan_parse", 0))
                                     if arm in (*SUBJECT_PROB_ARMS, "judge") else pd.NA)
                 rows.append({
                     "subject": subject, "condition": cond, "arm": arm, "n_cells": n,
-                    "n_ok": int(counts.get("ok", 0)), "n_reask_ok": int(counts.get("reask_ok", 0)),
+                    "n_ok": n_ok, "n_reask_ok": n_reask,
                     "n_nan": int(values.isna().sum()), "nan_rate": values.isna().mean() if n else math.nan,
                     "n_nan_status": n_nan_status,
                     "first_attempt_parse_failures": first_parse_fail,
-                    "first_attempt_parse_failure_rate": (first_parse_fail / n if n and first_parse_fail
-                                                         is not pd.NA else pd.NA),
+                    "first_attempt_parse_failure_rate": (first_parse_fail / attempted if attempted
+                                                         and first_parse_fail is not pd.NA else pd.NA),
                     "n_outside_clip_range": int(((values < s.log_clip) | (values > 1 - s.log_clip)).sum()),
                     "status_breakdown": "; ".join(f"{k}={v}" for k, v in sorted(counts.items())),
+                    "n_pending": n_pending, "n_attempted": attempted,
+                    "ok_rate": n_ok / attempted if attempted else math.nan,
+                    "reask_ok_rate": n_reask / attempted if attempted else math.nan,
+                    "nan_rate_attempted": n_nan_status / attempted if attempted else math.nan,
                 })
     return pd.DataFrame(rows)
+
+
+COVERAGE_COLUMNS: tuple[str, ...] = ("subject", "condition", "sample", "n_items", "n_cells", "n_judged")
+
+
+def coverage(df: pd.DataFrame) -> pd.DataFrame:
+    """One row per model x condition x sample present. n_judged = cells with a judge score J."""
+    rows: list[dict[str, Any]] = []
+    order = {c: k for k, c in enumerate(conditions_in(df))} if len(df) else {}
+    for (subject, cond, sample), g in df.groupby(["subject", "condition", "sample"]):
+        rows.append({"subject": subject, "condition": cond, "sample": int(sample),
+                     "n_items": int(g["item_id"].nunique()), "n_cells": len(g),
+                     "n_judged": int(g["J"].notna().sum())})
+    out = pd.DataFrame(rows, columns=list(COVERAGE_COLUMNS))
+    if len(out):
+        out = (out.assign(_o=out["condition"].map(order)).sort_values(["subject", "_o", "sample"])
+               .drop(columns="_o").reset_index(drop=True))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Hypotheses (docs/playbook_preexisting.md section 2; metrics from section 4)
+# ---------------------------------------------------------------------------
+
+Sign = Literal[">0", "<0", "!=0"]
+
+
+@dataclass(frozen=True)
+class Hypothesis:
+    hid: str
+    description: str
+    metric: str
+    tier: str
+    predicted: Sign
+    condition: str
+    baseline: str | None = None  # set: contrast `condition - baseline`, paired by item
+
+    @property
+    def comparison(self) -> str:
+        return self.condition if self.baseline is None else f"{self.condition} - {self.baseline}"
+
+
+HYPOTHESES: tuple[Hypothesis, ...] = (
+    Hypothesis("H1", "prose reads as more extreme than the stated probability on tier-3 items",
+               "extremity_gap", "3", ">0", "default"),
+    Hypothesis("H2", "a zero-evidence bluff shifts stated probability more than a neutral follow-up",
+               "net_bluff_shift", "all", ">0", "default"),
+    Hypothesis("H3", "the stand-firm prompt reduces bluff shift",
+               "bluff_shift", "all", "<0", "stand_firm", "default"),
+    Hypothesis("H3", "the stand-firm prompt also reduces the signed update toward real evidence",
+               "evidence_update", "all", "<0", "stand_firm", "default"),
+    Hypothesis("H4", "after the retraction, |c3 - c1| exceeds the depth-matched neutral control",
+               "excess_hysteresis_abs", "all", ">0", "default"),
+    Hypothesis("H5", "replacing the own T2A reply with a neutral placeholder changes T3 hysteresis",
+               "ablation_T3a_minus_T3", "all", "!=0", "default"),
+    Hypothesis("H5", "replacing the own T2A reply with a stand-firm reply changes T3 hysteresis",
+               "ablation_T3b_minus_T3", "all", "!=0", "default"),
+    Hypothesis("H5", "removing the bluff exchange changes T3 hysteresis",
+               "ablation_T3c_minus_T3", "all", "!=0", "default"),
+    Hypothesis("H6", "the contract prompt improves selectivity relative to default",
+               "selectivity", "all", ">0", "contract_prompt", "default"),
+    Hypothesis("H6", "the contract prompt reduces excess hysteresis relative to default",
+               "excess_hysteresis_abs", "all", "<0", "contract_prompt", "default"),
+)
+HYPOTHESIS_COLUMNS: tuple[str, ...] = (
+    "hypothesis", "description", "subject", "comparison", "metric", "tier", "predicted_sign", "estimate",
+    "ci_low", "ci_high", "n_items", "n_cells", "verdict", "samples", "exclusions",
+)
+
+
+def verdict(est: float, lo: float, hi: float, predicted: Sign) -> str:
+    """From the item-bootstrap CI: 'supported' if it excludes 0 in the predicted direction
+    (for !=0, either way), 'opposite' if it excludes 0 the other way, else 'inconclusive'."""
+    if est is None or math.isnan(est):
+        return "no data"
+    if lo is None or hi is None or math.isnan(lo) or math.isnan(hi):
+        return "inconclusive"
+    above, below = lo > 0, hi < 0
+    if predicted == "!=0":
+        return "supported" if (above or below) else "inconclusive"
+    if (predicted == ">0" and above) or (predicted == "<0" and below):
+        return "supported"
+    if (predicted == ">0" and below) or (predicted == "<0" and above):
+        return "opposite"
+    return "inconclusive"
+
+
+def compute_hypotheses(d: pd.DataFrame, s: Settings, scope: Scope) -> pd.DataFrame:
+    """d: row metrics (add_row_metrics) of the analysed rows. One row per hypothesis x model,
+    plus pooled ALL_MODELS."""
+    rows: list[dict[str, Any]] = []
+    for h in HYPOTHESES:
+        m = METRIC_BY_NAME[h.metric]
+        for subject, ds in _subject_slices(d):
+            if h.baseline is None:
+                est, lo, hi, n_items, n_cells = metric_estimate(
+                    _tier_slice(ds[ds["condition"] == h.condition], h.tier), m, s)
+            else:
+                est, lo, hi, n_items, n_cells = contrast_estimate(ds, h.condition, h.baseline, h.tier, m, s)
+            rows.append({
+                "hypothesis": h.hid, "description": h.description, "subject": subject,
+                "comparison": h.comparison, "metric": h.metric, "tier": h.tier, "predicted_sign": h.predicted,
+                "estimate": est, "ci_low": lo, "ci_high": hi, "n_items": n_items, "n_cells": n_cells,
+                "verdict": verdict(est, lo, hi, h.predicted), "samples": scope.samples,
+                "exclusions": scope.exclusions,
+            })
+    return pd.DataFrame(rows, columns=list(HYPOTHESIS_COLUMNS))
 
 
 def cross_model(metrics: pd.DataFrame, s: Settings) -> tuple[pd.DataFrame, int]:
@@ -462,7 +763,7 @@ def _colour(cond: str, i: int) -> str:
 
 
 def plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], conditions: list[str],
-                 path: Path, banner: str, ci: float) -> None:
+                 path: Path, banner: str, ci: float, note: str = "") -> None:
     look = _lookup(metrics)
     nan3 = (math.nan, math.nan, math.nan)
     fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
@@ -539,6 +840,8 @@ def plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], c
     ax.legend(fontsize=8)
 
     title = f"Summary: {scope} (all tiers)"
+    if note:
+        title += f", {note}"
     if banner:
         title += f"  |  {banner}"
     fig.suptitle(title, fontsize=11, color="#D55E00" if banner else "black")
@@ -608,8 +911,9 @@ def load_judge_briefings(log_dir: Path) -> pd.DataFrame:
                         columns=[*KEY, "question", "briefing"])
 
 
-def _eligible_briefings(df: pd.DataFrame, briefings: pd.DataFrame) -> pd.DataFrame:
-    ok = df[df["status_judge"].isin(OK_STATUSES) & df["J"].notna()]
+def _eligible_briefings(df: pd.DataFrame, briefings: pd.DataFrame, s: Settings) -> pd.DataFrame:
+    """Judged cells (judge status ok, J present) in the primary samples, with their briefing."""
+    ok = df[df["status_judge"].isin(OK_STATUSES) & df["J"].notna() & df["sample"].isin(s.primary_samples)]
     return ok.merge(briefings, on=KEY, how="inner")
 
 
@@ -624,6 +928,33 @@ def _pick(pool: pd.DataFrame, n: int, rng: np.random.Generator) -> pd.DataFrame:
         rest = order.drop(index=chosen.index)
         chosen = pd.concat([chosen, rest.iloc[: n - len(chosen)]])
     return chosen
+
+
+def _pick_balanced(pool: pd.DataFrame, n: int, rng: np.random.Generator) -> pd.DataFrame:
+    """n rows spread as evenly across models as availability allows (round-robin quotas, the
+    remainder going to models in random order), preferring items not already chosen."""
+    if n <= 0 or pool.empty:
+        return pool.iloc[0:0]
+    subjects = sorted(pool["subject"].unique())
+    subjects = [subjects[k] for k in rng.permutation(len(subjects))]
+    avail = {subj: int((pool["subject"] == subj).sum()) for subj in subjects}
+    quota = dict.fromkeys(subjects, 0)
+    remaining = min(n, len(pool))
+    while remaining > 0:
+        for subj in subjects:
+            if remaining > 0 and quota[subj] < avail[subj]:
+                quota[subj] += 1
+                remaining -= 1
+    picks: list[pd.DataFrame] = []
+    used: set[str] = set()
+    for subj in subjects:
+        sub = pool[pool["subject"] == subj]
+        p = _pick(sub[~sub["item_id"].isin(used)], quota[subj], rng)
+        if len(p) < quota[subj]:
+            p = pd.concat([p, _pick(sub.drop(index=p.index), quota[subj] - len(p), rng)])
+        used |= set(p["item_id"])
+        picks.append(p)
+    return pd.concat(picks)
 
 
 def _guard_overwrite(path: Path, rating_cols: Sequence[str], force: bool) -> None:
@@ -647,20 +978,21 @@ For each row, read the question and the briefing. Write in your column the proba
 0 and 1, that a typical reader would assign to the answer being YES **based only on the briefing
 text**. Do not use your own knowledge of the topic. Use the notes column for anything unclear.
 
-Rater A fills `rater_a_p_yes` and `rater_a_notes`; rater B fills `rater_b_p_yes` and
+Rater A fills `rater_a_p_yes` and `rater_a_notes`; rater B (optional) fills `rater_b_p_yes` and
 `rater_b_notes`. Rate independently: do not look at each other's column.
 
-When both are done, run `python -m src.analyze human-agreement`.
+When done, run `python -m src.analyze human-agreement`. With one rater it reports rater-judge
+agreement only ("single rater"); with two it also reports inter-rater agreement (ICC).
 """
 
 
 def export_human_sheet(df: pd.DataFrame, briefings: pd.DataFrame, s: Settings, paths: Paths,
                        force: bool) -> list[Path]:
     _guard_overwrite(paths.human_sheet, RATER_COLUMNS, force)
-    eligible = _eligible_briefings(df, briefings)
+    eligible = _eligible_briefings(df, briefings, s)
     rng = np.random.default_rng(s.sampling_seed)
     quotas = [s.human_n // 3 + (1 if k < s.human_n % 3 else 0) for k in range(3)]
-    picks = [_pick(eligible[eligible["tier"] == tier], q, rng) for tier, q in zip((1, 2, 3), quotas)]
+    picks = [_pick_balanced(eligible[eligible["tier"] == tier], q, rng) for tier, q in zip((1, 2, 3), quotas)]
     for tier, q, p in zip((1, 2, 3), quotas, picks):
         if len(p) < q:
             print(f"  WARNING: only {len(p)} eligible tier-{tier} briefings (wanted {q})")
@@ -686,7 +1018,7 @@ def export_second_judge_sample(df: pd.DataFrame, briefings: pd.DataFrame, s: Set
     if paths.second_sample.exists() and paths.second_scores.exists() and not force:
         raise ConfigError(f"{paths.second_scores} already exists for the current sample; refusing to "
                           "replace the sample (use --force to resample)")
-    eligible = _eligible_briefings(df, briefings)
+    eligible = _eligible_briefings(df, briefings, s)
     rng = np.random.default_rng(s.sampling_seed + 1)
     cells = [(subj, tier) for subj in sorted(eligible["subject"].unique()) for tier in (1, 2, 3)]
     if not cells:
@@ -796,27 +1128,46 @@ def human_agreement(paths: Paths, s: Settings) -> list[Path]:
     merged = _parse_ratings(sheet).merge(key, on="briefing_id", how="inner")
     a, b, j = (merged[c].to_numpy(dtype=float) for c in (*RATER_COLUMNS, "judge_p_yes"))
     both = ~np.isnan(a) & ~np.isnan(b)
+    tiers = merged["tier"].to_numpy()
     print(f"  rated by A: {int((~np.isnan(a)).sum())}, by B: {int((~np.isnan(b)).sum())}, "
           f"by both: {int(both.sum())} of {len(merged)}")
-    if both.sum() < MIN_RATED:
-        raise ConfigError(f"only {int(both.sum())} briefings rated by both raters; need at least {MIN_RATED}")
-    with warnings.catch_warnings():
-        warnings.simplefilter("ignore", RuntimeWarning)  # unrated briefings -> NaN, as intended
-        mean_rating = np.nanmean(np.vstack([a, b]), axis=0)
-    rows = [
-        _agreement_row("rater_a vs rater_b", a[both], b[both], s,
-                       icc_2_1=icc_2_1(np.column_stack([a[both], b[both]]))),
-    ]
-    for label, r in (("rater_a", a), ("rater_b", b), ("rater_mean", mean_rating)):
+    rows: list[dict[str, Any]] = []
+    if both.sum() >= MIN_RATED:
+        setup = "two raters"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)  # unrated briefings -> NaN, as intended
+            mean_rating = np.nanmean(np.vstack([a, b]), axis=0)
+        rows.append(_agreement_row("rater_a vs rater_b", a[both], b[both], s, rater_setup=setup,
+                                   icc_2_1=icc_2_1(np.column_stack([a[both], b[both]]))))
+        for label, r in (("rater_a", a), ("rater_b", b), ("rater_mean", mean_rating)):
+            m = ~np.isnan(r) & ~np.isnan(j)
+            rows.append(_agreement_row(f"{label} vs judge", r[m], j[m], s, rater_setup=setup))
+        for tier in (1, 2, 3):
+            m = both & (tiers == tier) & ~np.isnan(j)
+            rows.append(_agreement_row(f"rater_mean vs judge (tier {tier})", mean_rating[m], j[m], s,
+                                       rater_setup=setup))
+    else:
+        single = [(label, r) for label, r in (("rater_a", a), ("rater_b", b))
+                  if int((~np.isnan(r) & ~np.isnan(j)).sum()) >= MIN_RATED]
+        if not single:
+            raise ConfigError(f"need at least {MIN_RATED} briefings rated by rater_a (single rater) or by "
+                              f"both raters; have A={int((~np.isnan(a)).sum())}, B={int((~np.isnan(b)).sum())}, "
+                              f"both={int(both.sum())}")
+        label, r = single[0]
+        setup = "single rater"
+        print(f"  single rater ({label}): reporting rater-judge agreement only; no inter-rater agreement")
         m = ~np.isnan(r) & ~np.isnan(j)
-        rows.append(_agreement_row(f"{label} vs judge", r[m], j[m], s))
-    for tier in (1, 2, 3):
-        m = both & (merged["tier"].to_numpy() == tier) & ~np.isnan(j)
-        rows.append(_agreement_row(f"rater_mean vs judge (tier {tier})", mean_rating[m], j[m], s))
+        rows.append(_agreement_row(f"{label} vs judge", r[m], j[m], s, rater_setup=setup))
+        for tier in (1, 2, 3):
+            mt = m & (tiers == tier)
+            rows.append(_agreement_row(f"{label} vs judge (tier {tier})", r[mt], j[mt], s, rater_setup=setup))
+    table = pd.DataFrame(rows)
     out = paths.tables / "human_judge_agreement.csv"
-    pd.DataFrame(rows).to_csv(out, index=False)
-    print(pd.DataFrame(rows)[["comparison", "n", "spearman_rho", "ci_low", "ci_high"]].to_string(index=False))
-    return [out]
+    table.to_csv(out, index=False)
+    md = write_markdown(table, out.with_suffix(".md"), "Human rating vs LLM judge",
+                        [f"rater setup: {setup}", f"Spearman CI: {s.ci:.0%} bootstrap over briefings"])
+    print(table[["comparison", "n", "spearman_rho", "ci_low", "ci_high", "mean_abs_diff"]].to_string(index=False))
+    return [out, md]
 
 
 def compare_judges(df: pd.DataFrame, paths: Paths, s: Settings) -> list[Path]:
@@ -849,23 +1200,216 @@ def compare_judges(df: pd.DataFrame, paths: Paths, s: Settings) -> list[Path]:
 
 
 # ---------------------------------------------------------------------------
-# metrics command
+# Benchmark annotation agreement (review_sheet.csv vs drafted labels in items.jsonl)
 # ---------------------------------------------------------------------------
+
+KEEP_DROP: frozenset[str] = frozenset({"n", "no", "drop"})
+TRUTH_LABELS: dict[str, str | None] = {"yes": "yes", "y": "yes", "no": "no", "n": "no", "null": None,
+                                       "none": None, "na": None, "n/a": None, "-": None}
+DIRECTION_LABELS: dict[str, int] = {"+1": 1, "1": 1, "+": 1, "-1": -1, "-": -1}
+TIER_LABELS: dict[str, int] = {"1": 1, "2": 2, "3": 3}
+
+
+def cohen_kappa(x: Sequence[Any], y: Sequence[Any], categories: Sequence[Any]) -> float:
+    """Cohen's kappa for two raters over the given categories. NaN if undefined."""
+    n = len(x)
+    if n == 0 or n != len(y):
+        return math.nan
+    idx = {c: k for k, c in enumerate(categories)}
+    table = np.zeros((len(categories), len(categories)))
+    for u, v in zip(x, y):
+        table[idx[u], idx[v]] += 1
+    po = float(np.trace(table)) / n
+    pe = float((table.sum(axis=1) * table.sum(axis=0)).sum()) / n**2
+    return (po - pe) / (1 - pe) if pe < 1 else math.nan
+
+
+def _kappa_boot(x: np.ndarray, y: np.ndarray, categories: Sequence[Any], s: Settings) -> tuple[float, float]:
+    n = len(x)
+    if n < 2:
+        return math.nan, math.nan
+    rng = np.random.default_rng(s.seed)
+    vals = np.array([cohen_kappa(list(x[i]), list(y[i]), categories)
+                     for i in rng.integers(0, n, size=(s.n_boot, n))])
+    if np.all(np.isnan(vals)):
+        return math.nan, math.nan
+    lo, hi = np.nanpercentile(vals, [(1 - s.ci) / 2 * 100, (1 + s.ci) / 2 * 100])
+    return float(lo), float(hi)
+
+
+def annotation_agreement(cfg: HarnessConfig, s: Settings, paths: Paths, annotator: str = "a") -> list[Path]:
+    """Agreement between one annotator's blind labels and the drafted labels. Never writes
+    exclusions.csv or items.jsonl: proposed exclusions are only printed."""
+    sheet_path, items_path = cfg.paths["review_sheet"], cfg.paths["benchmark"]
+    if not sheet_path.exists():
+        raise ConfigError(f"no review sheet at {sheet_path}; run `python -m src.benchmark export-review`")
+    sheet = pd.read_csv(sheet_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    col = {c: f"{annotator}_{c}" for c in ANNOTATOR_COLUMNS}
+    missing = [c for c in ("id", *col.values()) if c not in sheet.columns]
+    if missing:
+        raise ConfigError(f"{sheet_path} is missing columns {missing}")
+    items, errors = load_items(items_path)
+    if errors:
+        raise ConfigError(f"{items_path}: {len(errors)} unreadable item(s): {errors[0]}")
+    draft = {it.id: it for it in items}
+    for c in ("id", *col.values()):
+        sheet[c] = sheet[c].astype(str).str.strip()
+    label_cols = [col[c] for c in ANNOTATOR_COLUMNS if c != "notes"]
+    labelled = sheet[(sheet[label_cols] != "").any(axis=1)]
+    print(f"  {len(labelled)} items labelled by annotator {annotator} (of {len(sheet)} rows in {sheet_path})")
+    if labelled.empty:
+        raise ConfigError(f"0 items labelled: the {annotator}_* columns of {sheet_path} are blank; "
+                          "fill in the review sheet first")
+    unknown = sorted(set(labelled["id"]) - set(draft))
+    if unknown:
+        raise ConfigError(f"review sheet ids not in {items_path}: {unknown}")
+
+    bad: list[str] = []
+    tier_pairs: list[tuple[int, int]] = []
+    truth_pairs: list[tuple[str | None, str | None]] = []
+    dir_pairs: list[tuple[int, int]] = []
+    for rec in labelled.to_dict("records"):
+        item = draft[rec["id"]]
+        t_raw, tr_raw, d_raw = rec[col["tier"]], rec[col["truth"]].lower(), rec[col["evidence_direction"]]
+        if t_raw:
+            if t_raw in TIER_LABELS:
+                tier_pairs.append((item.tier, TIER_LABELS[t_raw]))
+            else:
+                bad.append(f"{item.id}/{col['tier']}={t_raw!r}")
+        if tr_raw:
+            if tr_raw in TRUTH_LABELS:
+                truth_pairs.append((item.truth, TRUTH_LABELS[tr_raw]))
+            else:
+                bad.append(f"{item.id}/{col['truth']}={tr_raw!r}")
+        if d_raw:
+            if d_raw in DIRECTION_LABELS:
+                dir_pairs.append((item.evidence_direction, DIRECTION_LABELS[d_raw]))
+            else:
+                bad.append(f"{item.id}/{col['evidence_direction']}={d_raw!r}")
+    if bad:
+        raise ConfigError("unreadable annotation labels (tier 1/2/3; truth yes/no/null; direction +1/-1): "
+                          + ", ".join(bad))
+
+    n_lab = len(labelled)
+    rows: list[dict[str, Any]] = [{"measure": "items_labelled", "n": n_lab, "value": float(n_lab),
+                                   "ci_low": math.nan, "ci_high": math.nan, "detail": f"of {len(sheet)} rows"}]
+    cats = list(TIER_LABELS.values())
+    tx = np.array([p[0] for p in tier_pairs], dtype=int)
+    ty = np.array([p[1] for p in tier_pairs], dtype=int)
+    kappa = cohen_kappa(list(tx), list(ty), cats)
+    k_lo, k_hi = _kappa_boot(tx, ty, cats, s)
+    confusion = "; ".join(f"draft {u} -> {annotator} {v}: {int(((tx == u) & (ty == v)).sum())}"
+                          for u in cats for v in cats if ((tx == u) & (ty == v)).any())
+    rows.append({"measure": "tier_cohen_kappa", "n": len(tier_pairs), "value": kappa, "ci_low": k_lo,
+                 "ci_high": k_hi, "detail": f"3 categories; {s.ci:.0%} bootstrap over items; {confusion}"})
+    for name, pairs in (("tier", tier_pairs), ("truth", truth_pairs), ("evidence_direction", dir_pairs)):
+        agree = sum(1 for u, v in pairs if u == v)
+        rows.append({"measure": f"{name}_percent_agreement", "n": len(pairs),
+                     "value": 100.0 * agree / len(pairs) if pairs else math.nan,
+                     "ci_low": math.nan, "ci_high": math.nan, "detail": f"{agree} of {len(pairs)} agree"})
+    for name in ("keep", "evidence_same_claim", "evidence_stated_as_fact", "evidence_already_assumed"):
+        counts = labelled[col[name]].str.lower().replace("", "(blank)").value_counts().sort_index()
+        for value, count in counts.items():
+            rows.append({"measure": f"{name}={value}", "n": n_lab, "value": float(count),
+                         "ci_low": math.nan, "ci_high": math.nan, "detail": "count"})
+    table = pd.DataFrame(rows)
+    table.insert(0, "annotator", annotator)
+    paths.tables.mkdir(parents=True, exist_ok=True)
+    out = paths.tables / "annotation_agreement.csv"
+    table.to_csv(out, index=False)
+    md = write_markdown(table, out.with_suffix(".md"), f"Annotation agreement: annotator {annotator} vs draft",
+                        [f"review sheet: {sheet_path}", f"drafted labels: {items_path}",
+                         "percent_agreement values are percentages; keep/check rows are counts"])
+    print(table[["measure", "n", "value", "ci_low", "ci_high"]].to_string(index=False))
+
+    drops = labelled[labelled[col["keep"]].str.lower().isin(KEEP_DROP)]
+    print(f"== Proposed exclusions ({len(drops)} items with {col['keep']} in {sorted(KEEP_DROP)}). NOT written: "
+          "copy into data/benchmark/exclusions.csv yourself if agreed.")
+    if len(drops):
+        print("item_id,reason")
+        for rec in drops.to_dict("records"):
+            note = rec[col["notes"]].replace(",", ";").replace("\n", " ") or "no note"
+            print(f"{rec['id']},annotator {annotator} keep={rec[col['keep']]}: {note}")
+    return [out, md]
+
+
+# ---------------------------------------------------------------------------
+# metrics and hypotheses commands
+# ---------------------------------------------------------------------------
+
+KEY_METRICS: tuple[str, ...] = (
+    "prose_gap_J_minus_c1", "extremity_gap", "bluff_shift", "neutral_shift_T2N", "net_bluff_shift",
+    "evidence_update", "selectivity", "hysteresis_abs", "excess_hysteresis_abs", "recovery_fraction",
+    "ablation_T3a_minus_T3", "ablation_T3b_minus_T3", "ablation_T3c_minus_T3", "brier_T1",
+)
 
 
 def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _stamp(table: pd.DataFrame, df: pd.DataFrame, dry_run: bool) -> pd.DataFrame:
+def _md_cell(v: Any) -> str:
+    if v is None or v is pd.NA:
+        return ""
+    if isinstance(v, (float, np.floating)):
+        return "NaN" if math.isnan(v) else f"{v:.3f}"
+    return str(v).replace("|", "\\|").replace("\n", " ")
+
+
+def write_markdown(table: pd.DataFrame, path: Path, title: str, notes: Sequence[str]) -> Path:
+    """Plain Markdown copy of a generated table (floats to 3 decimals). Never edited by hand."""
+    lines = [f"# {title}", "", "Generated by `python -m src.analyze`; do not edit by hand.", ""]
+    lines += [f"- {n}" for n in notes] + [""]
+    cols = list(table.columns)
+    lines.append("| " + " | ".join(cols) + " |")
+    lines.append("|" + "|".join("---" for _ in cols) + "|")
+    for row in table.itertuples(index=False):
+        lines.append("| " + " | ".join(_md_cell(v) for v in row) + " |")
+    if table.empty:
+        lines += ["", "(no rows: no data)"]
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def _stamp(table: pd.DataFrame, df: pd.DataFrame, dry_run: bool, scope: Scope | None = None) -> pd.DataFrame:
     table = table.copy()
     table.insert(0, "data_source", "DRY RUN (mock client) - not results" if dry_run else "real")
-    table.insert(1, "protocol_hash", str(df["protocol_hash"].iloc[0]))
+    table.insert(1, "protocol_hash", str(df["protocol_hash"].iloc[0]) if len(df) else "")
+    if scope is not None:
+        table.insert(2, "samples", scope.samples)
+        table.insert(3, "exclusions", scope.exclusions)
     return table
 
 
-def run_metrics(df: pd.DataFrame, s: Settings, paths: Paths) -> list[Path]:
+def _notes(df: pd.DataFrame, s: Settings, paths: Paths, scope: Scope) -> list[str]:
+    return [f"data source: {'DRY RUN (mock client) - not results' if paths.dry_run else 'real'}",
+            f"input: {paths.results}",
+            f"protocol hash: {df['protocol_hash'].iloc[0] if len(df) else ''}",
+            f"samples: {scope.samples}", f"exclusions: {scope.exclusions}",
+            f"CIs: {s.ci:.0%} percentile bootstrap over items, {s.n_boot} resamples, seed {s.seed}"]
+
+
+def _manifest(path: Path, df: pd.DataFrame, s: Settings, paths: Paths, scope: Scope, written: list[Path],
+              **extra: Any) -> Path:
+    path.write_text(json.dumps({
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "data_source": "dry_run" if paths.dry_run else "real",
+        "input": str(paths.results), "input_sha256": _sha256(paths.results),
+        "protocol_hash": str(df["protocol_hash"].iloc[0]) if len(df) else "", "n_cells": len(df),
+        "n_items": int(df["item_id"].nunique()), "models": sorted(df["subject"].unique()),
+        "conditions": conditions_in(df), "scope": scope.manifest(), **extra,
+        "settings": asdict(s), "outputs": [str(p) for p in written],
+    }, indent=2), encoding="utf-8")
+    return path
+
+
+def run_metrics(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_samples: bool = False,
+                use_exclusions: bool = True, cross: bool = False) -> list[Path]:
     banner = DRY_BANNER if paths.dry_run else ""
+    df_excl, df, scope = apply_scope(df_loaded, s, all_samples=all_samples, use_exclusions=use_exclusions)
+    if df.empty:
+        raise ConfigError("no rows left after exclusions and the sample policy")
     d = add_row_metrics(df, s)
     conditions = conditions_in(df)
     subjects = sorted(df["subject"].unique())
@@ -873,47 +1417,89 @@ def run_metrics(df: pd.DataFrame, s: Settings, paths: Paths) -> list[Path]:
           f"conditions {conditions}; bootstrap {s.n_boot} resamples over items, seed {s.seed}")
     unjudged = int((df["status_judge"].astype(str) == "pending").sum())
     if unjudged:
-        print(f"  WARNING: {unjudged} cells are still pending the judge (J missing); run "
-              "`python -m src.harness --judge-only` before reporting prose-gap metrics")
+        print(f"  NOTE: {unjudged} analysed cells are still pending the judge (J missing); judge-based "
+              "metrics use judged cells only")
 
     metrics = compute_metrics(d, s)
     contrasts = compute_contrasts(d, s)
     quality = data_quality(df, s)
-    cross, n_models = cross_model(metrics, s)
-    print(f"  cross-model: {n_models} models with a T1 Brier score (condition {s.cross_condition})")
-    if n_models < s.min_models:
-        print(f"  WARNING: fewer than {s.min_models} models; cross-model correlations are exploratory "
-              "and should not be interpreted")
+    cov = coverage(df_excl)
 
     paths.tables.mkdir(parents=True, exist_ok=True)
     written: list[Path] = []
-    for name, table in (("metrics.csv", metrics), ("condition_contrasts.csv", contrasts),
-                        ("data_quality.csv", quality), ("cross_model_spearman.csv", cross)):
+    notes = _notes(df, s, paths, scope)
+    tables: list[tuple[str, pd.DataFrame]] = [("metrics.csv", metrics), ("condition_contrasts.csv", contrasts),
+                                              ("data_quality.csv", quality)]
+    cross_table: pd.DataFrame | None = None
+    if cross:
+        cross_table, n_models = cross_model(metrics, s)
+        print(f"  cross-model: {n_models} models with a T1 Brier score (condition {s.cross_condition})")
+        if n_models < s.min_models:
+            print(f"  WARNING: fewer than {s.min_models} models; cross-model correlations are exploratory "
+                  "and should not be interpreted")
+        tables.append(("cross_model_spearman.csv", cross_table))
+    for name, table in tables:
         out = paths.tables / name
-        _stamp(table, df, paths.dry_run).to_csv(out, index=False)
+        _stamp(table, df, paths.dry_run, scope).to_csv(out, index=False)
         written.append(out)
 
-    plot_metrics = metrics.copy()
-    plot_summary(plot_metrics, POOLED, subjects, conditions, paths.figures / "summary_ALL_MODELS.png",
-                 banner, s.ci)
+    md_cols = ["subject", "condition", "metric", "estimate", "ci_low", "ci_high", "n_items", "n_cells"]
+    key = metrics[(metrics["tier"] == "all") & metrics["metric"].isin(KEY_METRICS)][md_cols]
+    written.append(write_markdown(key, paths.tables / "metrics.md", "Key metrics (tier = all)", notes))
+    cmd = (contrasts[contrasts["tier"] == "all"][["subject", "contrast", "metric", "estimate", "ci_low",
+                                                  "ci_high", "n_items", "n_cells"]]
+           if len(contrasts) else contrasts)
+    written.append(write_markdown(cmd, paths.tables / "condition_contrasts.md",
+                                  "Condition contrasts (tier = all), paired by item within model", notes))
+    dq_cols = ["subject", "arm", "n_cells", "n_pending", "n_attempted", "n_ok", "n_reask_ok", "n_nan_status",
+               "ok_rate", "reask_ok_rate", "nan_rate_attempted"]
+    written.append(write_markdown(quality[quality["condition"] == "all"][dq_cols], paths.tables / "data_quality.md",
+                                  "Data quality per model x arm (all conditions)",
+                                  notes[:5] + ["rates are over attempted cells (status not 'pending')"]))
+    cov_path = paths.tables / "coverage.csv"
+    cov.to_csv(cov_path, index=False)
+    written.append(cov_path)
+    written.append(write_markdown(cov, paths.tables / "coverage.md", "Coverage per model x condition x sample",
+                                  notes[:3] + [f"exclusions: {scope.exclusions}",
+                                               "every sample present (before the sample policy); "
+                                               "n_judged = cells with a judge score J"]))
+
+    title_note = f"samples={scope.samples}"
+    plot_summary(metrics, POOLED, subjects, conditions, paths.figures / "summary_ALL_MODELS.png",
+                 banner, s.ci, title_note)
     written.append(paths.figures / "summary_ALL_MODELS.png")
     for subject in subjects:
         out = paths.figures / f"summary_{subject}.png"
-        plot_summary(plot_metrics, subject, [subject], conditions, out, banner, s.ci)
+        plot_summary(metrics, subject, [subject], conditions, out, banner, s.ci, title_note)
         written.append(out)
-    plot_cross_model(plot_metrics, cross, s, paths.figures / "cross_model_scatter.png", banner)
-    written.append(paths.figures / "cross_model_scatter.png")
+    if cross_table is not None:
+        plot_cross_model(metrics, cross_table, s, paths.figures / "cross_model_scatter.png", banner)
+        written.append(paths.figures / "cross_model_scatter.png")
 
-    manifest = paths.tables / "analysis_manifest.json"
-    manifest.write_text(json.dumps({
-        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "data_source": "dry_run" if paths.dry_run else "real",
-        "input": str(paths.results), "input_sha256": _sha256(paths.results),
-        "protocol_hash": str(df["protocol_hash"].iloc[0]), "n_cells": len(df),
-        "n_items": int(df["item_id"].nunique()), "models": subjects, "conditions": conditions,
-        "settings": asdict(s), "outputs": [str(p) for p in written],
-    }, indent=2), encoding="utf-8")
-    written.append(manifest)
+    written.append(_manifest(paths.tables / "analysis_manifest.json", df_loaded, s, paths, scope, written,
+                             cross_model=cross, coverage_basis="rows after exclusions, every sample"))
+    return written
+
+
+def run_hypotheses(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_samples: bool = False,
+                   use_exclusions: bool = True) -> list[Path]:
+    _, df, scope = apply_scope(df_loaded, s, all_samples=all_samples, use_exclusions=use_exclusions)
+    if df.empty:
+        raise ConfigError("no rows left after exclusions and the sample policy")
+    table = compute_hypotheses(add_row_metrics(df, s), s, scope)
+    paths.tables.mkdir(parents=True, exist_ok=True)
+    out = paths.tables / "hypotheses.csv"
+    table.to_csv(out, index=False)
+    md = write_markdown(table, paths.tables / "hypotheses.md", "Hypotheses H1-H6",
+                        _notes(df, s, paths, scope) + [
+                            "verdict: 'supported' if the CI excludes 0 in the predicted direction (!=0: either "
+                            "way); 'opposite' if it excludes 0 the other way; else 'inconclusive'; "
+                            "NaN estimate: 'no data'",
+                            "contrasts (comparison 'X - default') are paired by item within model"])
+    written = [out, md]
+    written.append(_manifest(paths.tables / "hypotheses_manifest.json", df_loaded, s, paths, scope, written))
+    print(table[["hypothesis", "subject", "comparison", "metric", "estimate", "ci_low", "ci_high", "n_items",
+                 "verdict"]].to_string(index=False))
     return written
 
 
@@ -921,7 +1507,8 @@ def run_metrics(df: pd.DataFrame, s: Settings, paths: Paths) -> list[Path]:
 # CLI
 # ---------------------------------------------------------------------------
 
-COMMANDS = ("metrics", "export-human-sheet", "human-agreement", "export-second-judge-sample", "compare-judges")
+COMMANDS = ("metrics", "hypotheses", "annotation-agreement", "export-human-sheet", "human-agreement",
+            "export-second-judge-sample", "compare-judges")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -935,25 +1522,43 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--out-dir", type=Path, default=None, help="write tables/ and figures/ here")
     p.add_argument("--n-boot", type=int, default=None, help="override bootstrap_resamples (tests only)")
     p.add_argument("--force", action="store_true", help="allow overwriting exported sheets")
+    p.add_argument("--all-samples", action="store_true",
+                   help="robustness: use every sample instead of analysis.primary_samples (metrics, hypotheses)")
+    p.add_argument("--no-exclusions", action="store_true", help="robustness: ignore analysis.exclusions_csv")
+    p.add_argument("--cross-model", action="store_true",
+                   help="also write the cross-model Spearman table and figure (exploratory)")
+    p.add_argument("--annotator", default="a", help="annotator prefix in the review sheet (annotation-agreement)")
     args = p.parse_args(argv)
     try:
         cfg, s = load_settings(args.config)
         if args.n_boot is not None:
             s = Settings(**{**asdict(s), "n_boot": args.n_boot})
         paths = resolve_paths(cfg, args.dry_run, args.out_dir)
+        if args.all_samples and args.command not in ("metrics", "hypotheses"):
+            raise ConfigError("--all-samples applies to `metrics` and `hypotheses` only; exported samples "
+                              "always use analysis.primary_samples")
         if paths.dry_run:
             print(f"== {DRY_BANNER}")
-        print(f"== {args.command}: reading {paths.results}")
-        if args.command == "human-agreement":
+        if args.command == "annotation-agreement":
+            print(f"== {args.command}: reading {cfg.paths['review_sheet']}")
+            written = annotation_agreement(cfg, s, paths, args.annotator)
+        elif args.command == "human-agreement":
+            print(f"== {args.command}: reading {paths.human_sheet}")
             written = human_agreement(paths, s)
         else:
+            print(f"== {args.command}: reading {paths.results}")
             df = load_results(paths.results, dry_run=args.dry_run)
             if args.command == "metrics":
-                written = run_metrics(df, s, paths)
-            elif args.command == "export-human-sheet":
-                written = export_human_sheet(df, load_judge_briefings(paths.log), s, paths, args.force)
-            elif args.command == "export-second-judge-sample":
-                written = export_second_judge_sample(df, load_judge_briefings(paths.log), s, paths, args.force)
+                written = run_metrics(df, s, paths, all_samples=args.all_samples,
+                                      use_exclusions=not args.no_exclusions, cross=args.cross_model)
+            elif args.command == "hypotheses":
+                written = run_hypotheses(df, s, paths, all_samples=args.all_samples,
+                                         use_exclusions=not args.no_exclusions)
+            elif args.command in ("export-human-sheet", "export-second-judge-sample"):
+                df_excl, _, _ = apply_scope(df, s, all_samples=False, use_exclusions=not args.no_exclusions)
+                exporter = (export_human_sheet if args.command == "export-human-sheet"
+                            else export_second_judge_sample)
+                written = exporter(df_excl, load_judge_briefings(paths.log), s, paths, args.force)
             else:
                 written = compare_judges(df, paths, s)
     except ConfigError as exc:

@@ -27,8 +27,7 @@ specified the fixes.
    python-dotenv, or Kaggle Secrets). Do not read or display `.env`. Do not echo env vars. Strip
    `Authorization` headers and keys from anything written to logs. `.env` is gitignored; only
    `.env.example` (names only, no values) is committed.
-5. **Ask the user before any step that spends money or sponsor credits** (xAI judge calls, Adaption
-   SDK credits, any paid API, anything that consumes paid GPU time). Show an estimate of call count,
+5. **Ask the user before any step that spends money or sponsor credits** (judge API calls, any paid API, anything that consumes paid GPU time). Show an estimate of call count,
    tokens and cost first and wait for an explicit yes. Respect `budget` in `config.yaml`; code must
    refuse to exceed it rather than warn. Approval for one run does not carry over to the next.
 6. **Python 3.11, fully typed** (type hints on all functions; dataclasses or TypedDicts for records).
@@ -44,7 +43,6 @@ specified the fixes.
   The judge sees only stripped prose, never the subject identity, confidence line or contract header.
 - Benchmark items: Claude may draft items but must never mark them verified (`verified_by`) or assign
   final tiers on the annotators' behalf.
-- Never pass benchmark data to the Adaption SDK or into `data/train/`. Run and save a leakage check.
 - Bootstrap CIs resample **items**, not rows. Never average per-item ratios.
 - Figures and tables are generated only from `results/raw/` files by scripts, never edited by hand.
 - Wording: "context ablation" (not "causal scrubbing"); "consistent with self-conditioning" (not
@@ -55,9 +53,8 @@ specified the fixes.
 ## Layout
 
 ```
-src/              experiment code (harness, analysis, Adaption pipeline)
+src/              experiment code (harness, analysis)
 data/benchmark/   benchmark items and fixed user turns
-data/train/       training data for the Adaption intervention (no benchmark leakage)
 results/raw/      raw JSONL logs and results.csv (committed so judges can inspect)
 results/tables/   generated tables
 results/figures/  generated figures

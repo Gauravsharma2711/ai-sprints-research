@@ -492,8 +492,11 @@ def test_show_histories_prints_every_arm(tmp_path: Path, capsys: pytest.CaptureF
 # ---------------------------------------------------------------------------
 
 
+UNSET_JUDGE = {"model": None, "price_per_1m_input_usd": None, "price_per_1m_output_usd": None}
+
+
 def test_estimate_refuses_without_prices(tmp_path: Path) -> None:
-    assert main(["--config", str(write_config(tmp_path)), "--estimate", "--limit", "2"]) == 2
+    assert main(["--config", str(write_config(tmp_path, judge=UNSET_JUDGE)), "--estimate", "--limit", "2"]) == 2
     assert not (tmp_path / "real").exists()
 
 
@@ -562,7 +565,7 @@ def test_reasoning_effort_is_sent_to_the_judge(tmp_path: Path) -> None:
 
 
 def test_skip_judge_estimate_needs_no_judge_prices(tmp_path: Path) -> None:
-    cfg = str(write_config(tmp_path))      # judge prices are null in the repo config
+    cfg = str(write_config(tmp_path, judge=UNSET_JUDGE))
     assert main(["--config", cfg, "--estimate", "--limit", "1"]) == 2
     assert main(["--config", cfg, "--estimate", "--limit", "1", "--skip-judge"]) == 0
 
@@ -583,7 +586,7 @@ def test_spend_logged_in_out_dir_counts_toward_cap(tmp_path: Path, capsys: pytes
 
 def test_real_run_refuses_before_any_call(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     factory = Factory(**NO_FAILURES)
-    rc = main(["--config", str(write_config(tmp_path)), "--limit", "1"], mock_factory=factory)
+    rc = main(["--config", str(write_config(tmp_path, judge=UNSET_JUDGE)), "--limit", "1"], mock_factory=factory)
     err = capsys.readouterr().err
     assert rc == 2 and factory.calls == 0 and not (tmp_path / "real").exists()
     assert "judge.model is not set" in err and "not confirmed" in err and "unverified" in err
