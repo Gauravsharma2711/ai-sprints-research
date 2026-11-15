@@ -3,7 +3,12 @@
 Commands (add --dry-run to read the mock-client output in results/dry_run/ instead):
     python -m src.analyze metrics                     # tables + figures (primary samples)
     python -m src.analyze metrics --all-samples --out-dir <dir>   # robustness: every sample
-    python -m src.analyze hypotheses                  # H1-H6 table with verdicts from the item CIs
+    python -m src.analyze hypotheses                  # H1-H6 table with verdicts + forest figure
+    python -m src.analyze robustness                  # metrics + hypotheses under tables/robustness/
+                                                      #   all_samples/ and no_exclusions/
+    python -m src.analyze per-tier                    # key metrics by tier (also written by `metrics`)
+    python -m src.analyze all                         # all of the above, then each validation command
+                                                      #   whose input exists (else "skipped: waiting for")
     python -m src.analyze annotation-agreement        # review_sheet a_* labels vs drafted labels
     python -m src.analyze export-human-sheet          # 30 blind briefings for the raters
     python -m src.analyze human-agreement             # once the ratings are filled in (1 or 2 raters)
@@ -41,7 +46,7 @@ import math
 import sys
 import warnings
 from collections.abc import Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
@@ -77,8 +82,19 @@ PROB_COLUMNS: tuple[str, ...] = tuple(VALUE_COLUMN.values())
 DRY_BANNER = "DRY RUN: mock-client placeholders, not results"
 
 # Okabe-Ito palette (colourblind-safe); conditions also differ by marker in scatter plots.
+OKABE_ITO: dict[str, str] = {"orange": "#E69F00", "sky_blue": "#56B4E9", "bluish_green": "#009E73",
+                             "yellow": "#F0E442", "blue": "#0072B2", "vermillion": "#D55E00",
+                             "reddish_purple": "#CC79A7", "black": "#000000"}
 CONDITION_COLOURS: dict[str, str] = {"default": "#0072B2", "stand_firm": "#D55E00",
                                      "contract_prompt": "#009E73"}
+VERDICT_STYLE: dict[str, tuple[str, str]] = {  # verdict -> (Okabe-Ito colour, marker)
+    "supported": (OKABE_ITO["bluish_green"], "o"), "opposite": (OKABE_ITO["vermillion"], "s"),
+    "inconclusive": (OKABE_ITO["blue"], "D"), "no data": (OKABE_ITO["black"], "x")}
+REF_LINE = "#000000A0"  # reference lines: Okabe-Ito black, partly transparent
+FIG_MIN_FONT = 9  # pt; every figure text is at least this size
+FIG_RC: dict[str, Any] = {"font.size": 10, "axes.titlesize": 10, "axes.labelsize": 10,
+                          "xtick.labelsize": 9, "ytick.labelsize": 9, "legend.fontsize": 9,
+                          "figure.dpi": 100, "savefig.dpi": 300}
 EXTRA_COLOURS: tuple[str, ...] = ("#E69F00", "#56B4E9", "#CC79A7", "#000000")
 MODEL_COLOURS: tuple[str, ...] = ("#0072B2", "#D55E00", "#009E73", "#E69F00", "#56B4E9", "#CC79A7", "#000000")
 MARKERS: tuple[str, ...] = ("o", "s", "^", "D", "v", "P", "X", "*")
@@ -764,9 +780,15 @@ def _colour(cond: str, i: int) -> str:
 
 def plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], conditions: list[str],
                  path: Path, banner: str, ci: float, note: str = "") -> None:
+    with plt.rc_context(FIG_RC):
+        _plot_summary(metrics, scope, point_subjects, conditions, path, banner, ci, note)
+
+
+def _plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], conditions: list[str],
+                  path: Path, banner: str, ci: float, note: str) -> None:
     look = _lookup(metrics)
     nan3 = (math.nan, math.nan, math.nan)
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.8))
+    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
     pct = f"{ci:.0%} CI"
 
     # (A) trajectory |P - c1| at T1 -> T2 -> T3, bluff path vs neutral control
@@ -785,10 +807,10 @@ def plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], c
     ax.set_ylabel("mean |P(yes) - c1|")
     ax.set_title(f"(A) Movement from T1 ({pct})")
     handles = [Line2D([], [], color=_colour(c, i), lw=2, label=c) for i, c in enumerate(conditions)]
-    handles += [Line2D([], [], color="black", ls="-", marker="o", label="bluff -> release"),
-                Line2D([], [], color="black", ls="--", marker="o", markerfacecolor="white",
+    handles += [Line2D([], [], color=OKABE_ITO["black"], ls="-", marker="o", label="bluff -> release"),
+                Line2D([], [], color=OKABE_ITO["black"], ls="--", marker="o", markerfacecolor="white",
                        label="neutral control (T2N, T3N)")]
-    ax.legend(handles=handles, fontsize=8, loc="upper left")
+    ax.legend(handles=handles, loc="upper left")
 
     # (B) bluff shift vs evidence update
     ax = axes[1]
@@ -808,18 +830,19 @@ def plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], c
     finite = [v for v in xs_all + ys_all if not math.isnan(v)]
     if finite:
         lo_, hi_ = min(0.0, *finite), max(finite)
-        ax.plot([lo_, hi_], [lo_, hi_], color="grey", ls=":", lw=1)
-        ax.text(hi_, hi_, " evidence update = bluff shift", fontsize=7, color="grey", va="bottom", ha="right")
-    ax.axhline(0, color="grey", lw=0.8)
+        ax.plot([lo_, hi_], [lo_, hi_], color=REF_LINE, ls=":", lw=1)
+        ax.text(hi_, hi_, " evidence update = bluff shift", fontsize=FIG_MIN_FONT, color=REF_LINE,
+                va="bottom", ha="right")
+    ax.axhline(0, color=REF_LINE, lw=0.8)
     ax.set_xlabel("bluff shift |c2A - c1|")
     ax.set_ylabel("evidence update (c2B - c1) x direction")
     ax.set_title(f"(B) Bluff shift vs evidence update ({pct})")
     handles = [Line2D([], [], color=_colour(c, i), marker="o", ls="none", label=c)
                for i, c in enumerate(conditions)]
     if len(point_subjects) > 1:
-        handles += [Line2D([], [], color="black", marker=MARKERS[j % len(MARKERS)], ls="none", label=s)
-                    for j, s in enumerate(point_subjects)]
-    ax.legend(handles=handles, fontsize=7, loc="best")
+        handles += [Line2D([], [], color=OKABE_ITO["black"], marker=MARKERS[j % len(MARKERS)], ls="none",
+                           label=s) for j, s in enumerate(point_subjects)]
+    ax.legend(handles=handles, loc="best")
 
     # (C) T3 ablations vs plain T3
     ax = axes[2]
@@ -832,19 +855,19 @@ def plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], c
         est, lo, hi = zip(*vals)
         pos = np.arange(len(ablations)) + (i - (len(conditions) - 1) / 2) * width
         ax.bar(pos, np.nan_to_num(est), width=width, color=_colour(cond, i), label=cond,
-               yerr=_err(est, lo, hi), capsize=3, edgecolor="black", linewidth=0.5)
-    ax.axhline(0, color="black", lw=0.8)
+               yerr=_err(est, lo, hi), capsize=3, edgecolor=OKABE_ITO["black"], linewidth=0.5)
+    ax.axhline(0, color=OKABE_ITO["black"], lw=0.8)
     ax.set_xticks(np.arange(len(ablations)), [label for _, label in ablations])
     ax.set_ylabel("|c3x - c1| - |c3 - c1| (paired)")
     ax.set_title(f"(C) T3 ablations vs plain T3 ({pct})")
-    ax.legend(fontsize=8)
+    ax.legend()
 
     title = f"Summary: {scope} (all tiers)"
     if note:
         title += f", {note}"
     if banner:
         title += f"  |  {banner}"
-    fig.suptitle(title, fontsize=11, color="#D55E00" if banner else "black")
+    fig.suptitle(title, fontsize=12, color=OKABE_ITO["vermillion"] if banner else OKABE_ITO["black"])
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300, bbox_inches="tight")
@@ -869,12 +892,12 @@ def plot_cross_model(metrics: pd.DataFrame, cross: pd.DataFrame, s: Settings, pa
             ax.errorbar([x[0]], [y[0]], xerr=_err([x[0]], [x[1]], [x[2]]), yerr=_err([y[0]], [y[1]], [y[2]]),
                         color=MODEL_COLOURS[j % len(MODEL_COLOURS)],
                         marker=MARKERS[j % len(MARKERS)], capsize=3, linestyle="none")
-            ax.annotate(subject, (x[0], y[0]), fontsize=6, xytext=(3, 3), textcoords="offset points")
+            ax.annotate(subject, (x[0], y[0]), fontsize=FIG_MIN_FONT, xytext=(3, 3), textcoords="offset points")
         row = cross[cross["y_metric"] == name].iloc[0]
         rho = "n/a" if math.isnan(row["spearman_rho"]) else f"{row['spearman_rho']:.2f}"
-        ax.set_title(f"{name}\nSpearman rho = {rho}, n = {row['n_models']}", fontsize=9)
-        ax.set_xlabel("single-turn Brier (T1)", fontsize=8)
-        ax.tick_params(labelsize=7)
+        ax.set_title(f"{name}\nSpearman rho = {rho}, n = {row['n_models']}", fontsize=FIG_MIN_FONT + 1)
+        ax.set_xlabel("single-turn Brier (T1)", fontsize=FIG_MIN_FONT)
+        ax.tick_params(labelsize=FIG_MIN_FONT)
     for k in range(len(CROSS_METRICS), nrows * ncols):
         axes[k // ncols][k % ncols].axis("off")
     n = int(cross["n_models"].max()) if len(cross) else 0
@@ -885,6 +908,79 @@ def plot_cross_model(metrics: pd.DataFrame, cross: pd.DataFrame, s: Settings, pa
         title += f"  |  {banner}"
     fig.suptitle(title, fontsize=11, color="#D55E00" if (banner or n < s.min_models) else "black")
     fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=300, bbox_inches="tight")
+    plt.close(fig)
+
+
+def _forest_rows(hyp: pd.DataFrame) -> list[tuple[str, str, str]]:
+    """Unique (hypothesis, metric, comparison) rows, in table order."""
+    seen: list[tuple[str, str, str]] = []
+    for r in hyp.itertuples(index=False):
+        k = (str(r.hypothesis), str(r.metric), str(r.comparison))
+        if k not in seen:
+            seen.append(k)
+    return seen
+
+
+def plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
+    """Forest plot of hypotheses.csv: one row per hypothesis x metric (x comparison). Pooled
+    ALL_MODELS is a filled marker; each model is a small open marker just below it, in a fixed
+    order named in the title. Item-bootstrap CI; colour and marker by verdict; vertical line at 0."""
+    with plt.rc_context(FIG_RC):
+        _plot_forest(hyp, path, banner, ci)
+
+
+def _plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
+    rows = _forest_rows(hyp)
+    models = sorted(set(hyp["subject"]) - {POOLED})
+    step = 0.6 / max(1, len(models))
+    fig, ax = plt.subplots(figsize=(3.5, 1.6 + 0.62 * max(1, len(rows))))
+    labels: list[str] = []
+    finite: list[float] = []
+    for y_idx, (hid, metric_name, comparison) in enumerate(rows):
+        y0 = -float(y_idx)
+        labels.append(f"{hid}: {metric_name}\n{comparison}")
+        sub = hyp[(hyp["hypothesis"] == hid) & (hyp["metric"] == metric_name) & (hyp["comparison"] == comparison)]
+        points = [(POOLED, y0, True)] + [(m, y0 - step * (k + 1), False) for k, m in enumerate(models)]
+        for subject, y, filled in points:
+            r = sub[sub["subject"] == subject]
+            if r.empty:
+                continue
+            est, lo, hi = (float(r.iloc[0][c]) for c in ("estimate", "ci_low", "ci_high"))
+            if math.isnan(est):
+                continue
+            colour, marker = VERDICT_STYLE.get(str(r.iloc[0]["verdict"]), VERDICT_STYLE["no data"])
+            ax.errorbar([est], [y], xerr=_err([est], [lo], [hi]), color=colour, marker=marker,
+                        markersize=6 if filled else 3.5, markerfacecolor=colour if filled else "white",
+                        markeredgewidth=1.0, elinewidth=1.4 if filled else 0.7, capsize=2 if filled else 0,
+                        linestyle="none", zorder=3 if filled else 2)
+            finite += [v for v in (est, lo, hi) if not math.isnan(v)]
+    ax.axvline(0, color=OKABE_ITO["black"], lw=0.8, zorder=1)
+    ax.set_yticks([-float(k) for k in range(len(rows))], labels)
+    ax.set_ylim(-(max(1, len(rows)) - 1) - 0.8, 0.5)
+    if finite:
+        pad = 0.06 * ((max(finite) - min(finite)) or 1.0)
+        ax.set_xlim(min(0.0, *finite) - pad, max(0.0, *finite) + pad)
+    ax.set_xlabel(f"estimate ({ci:.0%} CI, bootstrap over items)")
+    ax.grid(axis="x", color=REF_LINE, lw=0.4, alpha=0.4)
+    present = set(hyp["verdict"].astype(str))
+    handles = [Line2D([], [], color=c, marker=m, ls="none", label=v) for v, (c, m) in VERDICT_STYLE.items()
+               if v in present]
+    handles += [Line2D([], [], color=OKABE_ITO["black"], marker="o", ls="none", markersize=6, label=POOLED),
+                Line2D([], [], color=OKABE_ITO["black"], marker="o", ls="none", markersize=3.5,
+                       markerfacecolor="white", label="per model")]
+    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 0.0))
+    title = "Hypotheses H1-H6"
+    if len(hyp):
+        title += f"\nsamples={hyp['samples'].iloc[0]}; exclusions {hyp['exclusions'].iloc[0]}"
+    if models:
+        title += "\nopen markers, top to bottom:\n" + ", ".join(models)
+    if banner:
+        title = f"{banner}\n{title}"
+    ax.set_title(title, fontsize=FIG_MIN_FONT, color=OKABE_ITO["vermillion"] if banner else OKABE_ITO["black"])
+    n_leg_rows = math.ceil(len(handles) / 2)
+    fig.tight_layout(rect=(0.0, 0.035 * n_leg_rows * 5 / max(5.0, 1.6 + 0.62 * len(rows)), 1.0, 1.0))
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -1007,9 +1103,9 @@ def export_human_sheet(df: pd.DataFrame, briefings: pd.DataFrame, s: Settings, p
     key = chosen[["briefing_id", *KEY, "tier"]].copy()
     key["judge_p_yes"] = chosen["J"]
     paths.tables.mkdir(parents=True, exist_ok=True)
-    sheet.to_csv(paths.human_sheet, index=False, encoding="utf-8-sig")
-    key.to_csv(paths.human_key, index=False)
-    paths.human_instructions.write_text(HUMAN_INSTRUCTIONS, encoding="utf-8")
+    sheet.to_csv(paths.human_sheet, index=False, encoding="utf-8-sig", lineterminator="\n")
+    key.to_csv(paths.human_key, index=False, lineterminator="\n")
+    paths.human_instructions.write_text(HUMAN_INSTRUCTIONS, encoding="utf-8", newline="\n")
     return [paths.human_sheet, paths.human_key, paths.human_instructions]
 
 
@@ -1036,7 +1132,7 @@ def export_second_judge_sample(df: pd.DataFrame, briefings: pd.DataFrame, s: Set
     chosen["briefing_id"] = [f"S{k + 1:0{width}d}" for k in range(len(chosen))]
     out = chosen[["briefing_id", *KEY, "tier", "question", "briefing"]]
     paths.tables.mkdir(parents=True, exist_ok=True)
-    out.to_csv(paths.second_sample, index=False, encoding="utf-8")
+    out.to_csv(paths.second_sample, index=False, encoding="utf-8", lineterminator="\n")
     return [paths.second_sample]
 
 
@@ -1163,7 +1259,7 @@ def human_agreement(paths: Paths, s: Settings) -> list[Path]:
             rows.append(_agreement_row(f"{label} vs judge (tier {tier})", r[mt], j[mt], s, rater_setup=setup))
     table = pd.DataFrame(rows)
     out = paths.tables / "human_judge_agreement.csv"
-    table.to_csv(out, index=False)
+    table.to_csv(out, index=False, lineterminator="\n")
     md = write_markdown(table, out.with_suffix(".md"), "Human rating vs LLM judge",
                         [f"rater setup: {setup}", f"Spearman CI: {s.ci:.0%} bootstrap over briefings"])
     print(table[["comparison", "n", "spearman_rho", "ci_low", "ci_high", "mean_abs_diff"]].to_string(index=False))
@@ -1193,7 +1289,7 @@ def compare_judges(df: pd.DataFrame, paths: Paths, s: Settings) -> list[Path]:
     out = paths.tables / "judge_comparison.csv"
     paths.tables.mkdir(parents=True, exist_ok=True)
     table = pd.DataFrame(rows).rename(columns={"mean_diff_y_minus_x": "mean_diff_J2_minus_J"})
-    table.to_csv(out, index=False)
+    table.to_csv(out, index=False, lineterminator="\n")
     print(table[["comparison", "n", "spearman_rho", "ci_low", "ci_high", "mean_diff_J2_minus_J"]]
           .to_string(index=False))
     return [out]
@@ -1316,7 +1412,7 @@ def annotation_agreement(cfg: HarnessConfig, s: Settings, paths: Paths, annotato
     table.insert(0, "annotator", annotator)
     paths.tables.mkdir(parents=True, exist_ok=True)
     out = paths.tables / "annotation_agreement.csv"
-    table.to_csv(out, index=False)
+    table.to_csv(out, index=False, lineterminator="\n")
     md = write_markdown(table, out.with_suffix(".md"), f"Annotation agreement: annotator {annotator} vs draft",
                         [f"review sheet: {sheet_path}", f"drafted labels: {items_path}",
                          "percent_agreement values are percentages; keep/check rows are counts"])
@@ -1344,8 +1440,65 @@ KEY_METRICS: tuple[str, ...] = (
 )
 
 
+PER_TIER_METRICS: tuple[str, ...] = (
+    "net_bluff_shift", "evidence_update", "selectivity", "excess_hysteresis_abs", "recovery_fraction",
+    "ablation_T3a_minus_T3", "ablation_T3b_minus_T3", "ablation_T3c_minus_T3", "prose_gap_J_minus_c1",
+    "extremity_gap", "brier_T1",
+)
+PER_TIER_TIERS: tuple[str, ...] = ("1", "2", "3")
+PER_TIER_COLUMNS: tuple[str, ...] = ("subject", "condition", "metric", "tier", "estimate", "ci_low", "ci_high",
+                                     "n_items", "n_cells", "samples", "exclusions")
+
+
+def per_tier_table(metrics: pd.DataFrame, scope: Scope) -> pd.DataFrame:
+    """Key metrics by tier (1, 2, 3), every subject incl. ALL_MODELS, from compute_metrics output."""
+    sub = metrics[metrics["tier"].isin(PER_TIER_TIERS) & metrics["metric"].isin(PER_TIER_METRICS)].copy()
+    order = {m: k for k, m in enumerate(PER_TIER_METRICS)}
+    subj_order = {sj: k for k, sj in enumerate(dict.fromkeys(metrics["subject"]))}
+    cond_order = {c: k for k, c in enumerate(dict.fromkeys(metrics["condition"]))}
+    sub = (sub.assign(_s=sub["subject"].map(subj_order), _c=sub["condition"].map(cond_order),
+                      _m=sub["metric"].map(order), _t=sub["tier"].astype(int))
+           .sort_values(["_s", "_c", "_m", "_t"]).drop(columns=["_s", "_c", "_m", "_t"]))
+    sub["samples"] = scope.samples
+    sub["exclusions"] = scope.exclusions
+    return sub[list(PER_TIER_COLUMNS)].reset_index(drop=True)
+
+
+def compute_per_tier(d: pd.DataFrame, s: Settings, scope: Scope) -> pd.DataFrame:
+    """Same numbers as the per-tier rows of compute_metrics (each bootstrap is seeded per call),
+    computed for the key metrics and tiers 1-3 only."""
+    rows: list[dict[str, Any]] = []
+    for subject, ds in _subject_slices(d):
+        for cond in conditions_in(d):
+            dc = ds[ds["condition"] == cond]
+            for tier in PER_TIER_TIERS:
+                dt = _tier_slice(dc, tier)
+                for name in PER_TIER_METRICS:
+                    est, lo, hi, n_items, n_cells = metric_estimate(dt, METRIC_BY_NAME[name], s)
+                    rows.append({"subject": subject, "condition": cond, "tier": tier, "metric": name,
+                                 "estimate": est, "ci_low": lo, "ci_high": hi, "n_items": n_items,
+                                 "n_cells": n_cells})
+    return per_tier_table(pd.DataFrame(rows), scope)
+
+
+def write_per_tier(table: pd.DataFrame, df: pd.DataFrame, s: Settings, paths: Paths, scope: Scope) -> list[Path]:
+    paths.tables.mkdir(parents=True, exist_ok=True)
+    out = paths.tables / "per_tier.csv"
+    table.to_csv(out, index=False, lineterminator="\n")
+    md = write_markdown(table, paths.tables / "per_tier.md", "Key metrics by evidence tier (1, 2, 3)",
+                        _notes(df, s, paths, scope) + ["tiers analysed separately; every subject and ALL_MODELS"])
+    return [out, md]
+
+
 def _sha256(path: Path) -> str:
+    """Hash of the bytes on disk (kept for compatibility; depends on the checkout's line endings)."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def sha256_lf(path: Path) -> str:
+    """Hash of the content with CRLF normalised to LF, so it matches a fresh git checkout (git
+    stores text files with LF) whatever line endings the local copy has."""
+    return hashlib.sha256(path.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
 
 
 def _md_cell(v: Any) -> str:
@@ -1368,7 +1521,7 @@ def write_markdown(table: pd.DataFrame, path: Path, title: str, notes: Sequence[
     if table.empty:
         lines += ["", "(no rows: no data)"]
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
     return path
 
 
@@ -1396,16 +1549,18 @@ def _manifest(path: Path, df: pd.DataFrame, s: Settings, paths: Paths, scope: Sc
         "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "data_source": "dry_run" if paths.dry_run else "real",
         "input": str(paths.results), "input_sha256": _sha256(paths.results),
+        "input_sha256_lf": sha256_lf(paths.results),
         "protocol_hash": str(df["protocol_hash"].iloc[0]) if len(df) else "", "n_cells": len(df),
         "n_items": int(df["item_id"].nunique()), "models": sorted(df["subject"].unique()),
         "conditions": conditions_in(df), "scope": scope.manifest(), **extra,
         "settings": asdict(s), "outputs": [str(p) for p in written],
-    }, indent=2), encoding="utf-8")
+    }, indent=2) + "\n", encoding="utf-8", newline="\n")
     return path
 
 
 def run_metrics(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_samples: bool = False,
-                use_exclusions: bool = True, cross: bool = False) -> list[Path]:
+                use_exclusions: bool = True, cross: bool = False, figures: bool = True,
+                manifest_extra: dict[str, Any] | None = None) -> list[Path]:
     banner = DRY_BANNER if paths.dry_run else ""
     df_excl, df, scope = apply_scope(df_loaded, s, all_samples=all_samples, use_exclusions=use_exclusions)
     if df.empty:
@@ -1440,7 +1595,7 @@ def run_metrics(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_sampl
         tables.append(("cross_model_spearman.csv", cross_table))
     for name, table in tables:
         out = paths.tables / name
-        _stamp(table, df, paths.dry_run, scope).to_csv(out, index=False)
+        _stamp(table, df, paths.dry_run, scope).to_csv(out, index=False, lineterminator="\n")
         written.append(out)
 
     md_cols = ["subject", "condition", "metric", "estimate", "ci_low", "ci_high", "n_items", "n_cells"]
@@ -1457,39 +1612,52 @@ def run_metrics(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_sampl
                                   "Data quality per model x arm (all conditions)",
                                   notes[:5] + ["rates are over attempted cells (status not 'pending')"]))
     cov_path = paths.tables / "coverage.csv"
-    cov.to_csv(cov_path, index=False)
+    cov.to_csv(cov_path, index=False, lineterminator="\n")
     written.append(cov_path)
     written.append(write_markdown(cov, paths.tables / "coverage.md", "Coverage per model x condition x sample",
                                   notes[:3] + [f"exclusions: {scope.exclusions}",
                                                "every sample present (before the sample policy); "
                                                "n_judged = cells with a judge score J"]))
+    written += write_per_tier(per_tier_table(metrics, scope), df, s, paths, scope)
 
-    title_note = f"samples={scope.samples}"
-    plot_summary(metrics, POOLED, subjects, conditions, paths.figures / "summary_ALL_MODELS.png",
-                 banner, s.ci, title_note)
-    written.append(paths.figures / "summary_ALL_MODELS.png")
-    for subject in subjects:
-        out = paths.figures / f"summary_{subject}.png"
-        plot_summary(metrics, subject, [subject], conditions, out, banner, s.ci, title_note)
-        written.append(out)
-    if cross_table is not None:
-        plot_cross_model(metrics, cross_table, s, paths.figures / "cross_model_scatter.png", banner)
-        written.append(paths.figures / "cross_model_scatter.png")
+    if figures:
+        title_note = f"samples={scope.samples}"
+        plot_summary(metrics, POOLED, subjects, conditions, paths.figures / "summary_ALL_MODELS.png",
+                     banner, s.ci, title_note)
+        written.append(paths.figures / "summary_ALL_MODELS.png")
+        for subject in subjects:
+            out = paths.figures / f"summary_{subject}.png"
+            plot_summary(metrics, subject, [subject], conditions, out, banner, s.ci, title_note)
+            written.append(out)
+        if cross_table is not None:
+            plot_cross_model(metrics, cross_table, s, paths.figures / "cross_model_scatter.png", banner)
+            written.append(paths.figures / "cross_model_scatter.png")
 
     written.append(_manifest(paths.tables / "analysis_manifest.json", df_loaded, s, paths, scope, written,
-                             cross_model=cross, coverage_basis="rows after exclusions, every sample"))
+                             cross_model=cross, coverage_basis="rows after exclusions, every sample",
+                             **(manifest_extra or {})))
     return written
 
 
+def run_per_tier(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_samples: bool = False,
+                 use_exclusions: bool = True) -> list[Path]:
+    _, df, scope = apply_scope(df_loaded, s, all_samples=all_samples, use_exclusions=use_exclusions)
+    if df.empty:
+        raise ConfigError("no rows left after exclusions and the sample policy")
+    table = compute_per_tier(add_row_metrics(df, s), s, scope)
+    return write_per_tier(table, df, s, paths, scope)
+
+
 def run_hypotheses(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_samples: bool = False,
-                   use_exclusions: bool = True) -> list[Path]:
+                   use_exclusions: bool = True, figures: bool = True,
+                   manifest_extra: dict[str, Any] | None = None) -> list[Path]:
     _, df, scope = apply_scope(df_loaded, s, all_samples=all_samples, use_exclusions=use_exclusions)
     if df.empty:
         raise ConfigError("no rows left after exclusions and the sample policy")
     table = compute_hypotheses(add_row_metrics(df, s), s, scope)
     paths.tables.mkdir(parents=True, exist_ok=True)
     out = paths.tables / "hypotheses.csv"
-    table.to_csv(out, index=False)
+    table.to_csv(out, index=False, lineterminator="\n")
     md = write_markdown(table, paths.tables / "hypotheses.md", "Hypotheses H1-H6",
                         _notes(df, s, paths, scope) + [
                             "verdict: 'supported' if the CI excludes 0 in the predicted direction (!=0: either "
@@ -1497,18 +1665,127 @@ def run_hypotheses(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_sa
                             "NaN estimate: 'no data'",
                             "contrasts (comparison 'X - default') are paired by item within model"])
     written = [out, md]
-    written.append(_manifest(paths.tables / "hypotheses_manifest.json", df_loaded, s, paths, scope, written))
+    if figures:
+        forest = paths.figures / "hypotheses_forest.png"
+        plot_forest(table, forest, DRY_BANNER if paths.dry_run else "", s.ci)
+        written.append(forest)
+    written.append(_manifest(paths.tables / "hypotheses_manifest.json", df_loaded, s, paths, scope, written,
+                             **(manifest_extra or {})))
     print(table[["hypothesis", "subject", "comparison", "metric", "estimate", "ci_low", "ci_high", "n_items",
                  "verdict"]].to_string(index=False))
     return written
+
+
+# Robustness variants: (directory name, all_samples, use_exclusions, description for the manifest)
+ROBUSTNESS_VARIANTS: tuple[tuple[str, bool, bool, str], ...] = (
+    ("all_samples", True, True, "every sample (not only analysis.primary_samples); exclusions applied"),
+    ("no_exclusions", False, False, "primary samples only; exclusions NOT applied"),
+)
+
+
+def robustness_paths(paths: Paths, variant: str) -> Paths:
+    return replace(paths, tables=paths.tables / "robustness" / variant,
+                   figures=paths.figures / "robustness" / variant)
+
+
+def run_robustness(df_loaded: pd.DataFrame, s: Settings, paths: Paths) -> list[Path]:
+    """The metrics and hypotheses code paths under each robustness scope, written to
+    tables/robustness/<variant>/ (tables only; no figures)."""
+    written: list[Path] = []
+    for variant, all_samples, use_excl, description in ROBUSTNESS_VARIANTS:
+        print(f"== robustness/{variant}: {description}")
+        vpaths = robustness_paths(paths, variant)
+        extra = {"robustness_variant": variant, "robustness_description": description}
+        written += run_metrics(df_loaded, s, vpaths, all_samples=all_samples, use_exclusions=use_excl,
+                               figures=False, manifest_extra=extra)
+        written += run_hypotheses(df_loaded, s, vpaths, all_samples=all_samples, use_exclusions=use_excl,
+                                  figures=False, manifest_extra=extra)
+    return written
+
+
+# ---------------------------------------------------------------------------
+# `all`: every analysis step, then the validation steps whose inputs exist
+# ---------------------------------------------------------------------------
+
+
+def _filled(path: Path, columns: Sequence[str]) -> bool:
+    """True if the CSV exists and any of the columns has a non-blank value."""
+    if not path.exists():
+        return False
+    table = pd.read_csv(path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    return any(c in table.columns and table[c].str.strip().ne("").any() for c in columns)
+
+
+def validation_inputs(cfg: HarnessConfig, paths: Paths, annotator: str = "a") -> dict[str, str | None]:
+    """For each validation command: None if its input is present, else what it is waiting for."""
+    label_cols = [f"{annotator}_{c}" for c in ANNOTATOR_COLUMNS if c != "notes"]
+    sheet = cfg.paths["review_sheet"]
+    return {
+        "annotation-agreement": (None if _filled(sheet, label_cols)
+                                 else f"{', '.join(label_cols)} in {sheet}"),
+        "human-agreement": (None if _filled(paths.human_sheet, ["rater_a_p_yes"])
+                            else f"rater_a_p_yes in {paths.human_sheet}"),
+        "compare-judges": None if paths.second_scores.exists() else str(paths.second_scores),
+    }
+
+
+def run_all(cfg: HarnessConfig, s: Settings, paths: Paths, *, cross: bool = False,
+            annotator: str = "a") -> tuple[list[Path], list[str]]:
+    """Returns (files written, names of failed steps)."""
+    written: list[Path] = []
+    failed: list[str] = []
+    df: pd.DataFrame | None = None
+    try:
+        df = load_results(paths.results, dry_run=paths.dry_run)
+    except ConfigError as exc:
+        print(f"ERROR (load results): {exc}", file=sys.stderr)
+        failed.append("load results")
+    steps: list[tuple[str, Any]] = []
+    if df is not None:
+        loaded = df
+        steps += [
+            ("metrics (tables, per-tier, summary figures)", lambda: run_metrics(loaded, s, paths, cross=cross)),
+            ("hypotheses (table, forest figure)", lambda: run_hypotheses(loaded, s, paths)),
+            ("robustness", lambda: run_robustness(loaded, s, paths)),
+        ]
+    def loaded_or_fail() -> pd.DataFrame:
+        if df is None:
+            raise ConfigError("results could not be loaded")
+        return df
+
+    waiting = validation_inputs(cfg, paths, annotator)
+    validators: dict[str, Any] = {
+        "annotation-agreement": lambda: annotation_agreement(cfg, s, paths, annotator),
+        "human-agreement": lambda: human_agreement(paths, s),
+        "compare-judges": lambda: compare_judges(loaded_or_fail(), paths, s),
+    }
+    for name, fn in steps:
+        print(f"== all: {name}")
+        try:
+            written += fn()
+        except ConfigError as exc:
+            print(f"ERROR ({name}): {exc}", file=sys.stderr)
+            failed.append(name)
+    for name, fn in validators.items():
+        if waiting[name] is not None:
+            print(f"== all: {name}: skipped: waiting for {waiting[name]}")
+            continue
+        print(f"== all: {name}")
+        try:
+            written += fn()
+        except ConfigError as exc:
+            print(f"ERROR ({name}): {exc}", file=sys.stderr)
+            failed.append(name)
+    return written, failed
 
 
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
-COMMANDS = ("metrics", "hypotheses", "annotation-agreement", "export-human-sheet", "human-agreement",
-            "export-second-judge-sample", "compare-judges")
+COMMANDS = ("metrics", "hypotheses", "robustness", "per-tier", "all", "annotation-agreement",
+            "export-human-sheet", "human-agreement", "export-second-judge-sample", "compare-judges")
+SCOPED_COMMANDS: tuple[str, ...] = ("metrics", "hypotheses", "per-tier")
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1534,11 +1811,25 @@ def main(argv: list[str] | None = None) -> int:
         if args.n_boot is not None:
             s = Settings(**{**asdict(s), "n_boot": args.n_boot})
         paths = resolve_paths(cfg, args.dry_run, args.out_dir)
-        if args.all_samples and args.command not in ("metrics", "hypotheses"):
-            raise ConfigError("--all-samples applies to `metrics` and `hypotheses` only; exported samples "
-                              "always use analysis.primary_samples")
+        if args.all_samples and args.command not in SCOPED_COMMANDS:
+            raise ConfigError("--all-samples applies to `metrics`, `hypotheses` and `per-tier` only; exported "
+                              "samples always use analysis.primary_samples, and `robustness`/`all` set the "
+                              "scope themselves")
+        if args.no_exclusions and args.command in ("robustness", "all"):
+            raise ConfigError("`robustness` and `all` set the scope themselves; --no-exclusions does not apply")
         if paths.dry_run:
             print(f"== {DRY_BANNER}")
+        if args.command == "all":
+            print(f"== all: reading {paths.results}")
+            written, failed = run_all(cfg, s, paths, cross=args.cross_model, annotator=args.annotator)
+            print("== Files written:")
+            for path in written:
+                print(f"  {path}")
+            if failed:
+                print(f"== all: FAILED steps: {failed}", file=sys.stderr)
+                return 2
+            print("== all: every step that could run succeeded")
+            return 0
         if args.command == "annotation-agreement":
             print(f"== {args.command}: reading {cfg.paths['review_sheet']}")
             written = annotation_agreement(cfg, s, paths, args.annotator)
@@ -1554,6 +1845,11 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "hypotheses":
                 written = run_hypotheses(df, s, paths, all_samples=args.all_samples,
                                          use_exclusions=not args.no_exclusions)
+            elif args.command == "per-tier":
+                written = run_per_tier(df, s, paths, all_samples=args.all_samples,
+                                       use_exclusions=not args.no_exclusions)
+            elif args.command == "robustness":
+                written = run_robustness(df, s, paths)
             elif args.command in ("export-human-sheet", "export-second-judge-sample"):
                 df_excl, _, _ = apply_scope(df, s, all_samples=False, use_exclusions=not args.no_exclusions)
                 exporter = (export_human_sheet if args.command == "export-human-sheet"

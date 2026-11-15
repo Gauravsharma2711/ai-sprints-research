@@ -619,3 +619,160 @@ def test_human_agreement_single_rater(dry_env: Path, tmp_path: Path) -> None:
     assert (agreement["rater_setup"] == "single rater").all()
     assert not math.isnan(first["mean_abs_diff"]) and "icc_2_1" not in agreement.columns
     assert (tables / "human_judge_agreement.md").exists()
+
+
+# --- robustness, per-tier, forest figure, `all` ---------------------------------------------
+
+
+def test_per_tier_columns_and_rows_on_synthetic_frame() -> None:
+    df = _unbalanced()
+    s = _settings()
+    _, analysed, scope = analyze.apply_scope(df, s, all_samples=False, use_exclusions=True)
+    d = add_row_metrics(analysed, s)
+    table = analyze.compute_per_tier(d, s, scope)
+    assert list(table.columns) == ["subject", "condition", "metric", "tier", "estimate", "ci_low", "ci_high",
+                                   "n_items", "n_cells", "samples", "exclusions"]
+    assert set(table["tier"]) == {"1", "2", "3"} and set(table["metric"]) == set(analyze.PER_TIER_METRICS)
+    assert set(table["subject"]) == {"m1", "m2", POOLED} and set(table["samples"]) == {"0"}
+    # same numbers as the per-tier rows of the full metrics table
+    from_metrics = analyze.per_tier_table(compute_metrics(d, s), scope)
+    pd.testing.assert_frame_equal(table, from_metrics)
+    row = table[(table.subject == "m1") & (table.condition == "default") & (table.metric == "extremity_gap")
+                & (table.tier == "3")].iloc[0]
+    assert row.estimate == pytest.approx(0.3) and row.n_items == 2 and row.n_cells == 2
+
+
+def _hyp_frame() -> pd.DataFrame:
+    df = _unbalanced()
+    s = _settings()
+    _, analysed, scope = analyze.apply_scope(df, s, all_samples=True, use_exclusions=False)
+    return analyze.compute_hypotheses(add_row_metrics(analysed, s), s, scope)
+
+
+def test_forest_plot_file_created(tmp_path: Path) -> None:
+    from PIL import Image
+
+    h = _hyp_frame()
+    assert len(analyze._forest_rows(h)) == len(analyze.HYPOTHESES)
+    for banner in ("", analyze.DRY_BANNER):
+        out = tmp_path / f"forest_{len(banner)}.png"
+        analyze.plot_forest(h, out, banner, 0.95)
+        with Image.open(out) as img:
+            assert img.info["dpi"][0] == pytest.approx(300, abs=1)
+
+
+def test_metrics_and_hypotheses_write_per_tier_and_forest(dry_env: Path, tmp_path: Path) -> None:
+    assert _run(dry_env, "metrics") == 0
+    tables = tmp_path / "dry/tables"
+    per_tier = pd.read_csv(tables / "per_tier.csv", dtype={"samples": str, "tier": str})
+    assert list(per_tier.columns) == list(analyze.PER_TIER_COLUMNS)
+    assert set(per_tier["subject"]) == {"llama-3.1-8b", "qwen2.5-7b", POOLED}
+    assert "DRY RUN" in (tables / "per_tier.md").read_text(encoding="utf-8")
+    out = tmp_path / "pt"
+    assert _run(dry_env, "per-tier", "--out-dir", str(out)) == 0
+    standalone = pd.read_csv(out / "tables/per_tier.csv", dtype={"samples": str, "tier": str})
+    pd.testing.assert_frame_equal(standalone, per_tier)
+    assert _run(dry_env, "hypotheses") == 0
+    assert (tmp_path / "dry/figures/hypotheses_forest.png").exists()
+
+
+def test_robustness_outputs(dry_env: Path, tmp_path: Path) -> None:
+    assert _run(dry_env, "robustness") == 0
+    base = tmp_path / "dry/tables/robustness"
+    for variant, samples, applied in (("all_samples", "all", True), ("no_exclusions", "0", False)):
+        d = base / variant
+        for name in ("metrics.csv", "hypotheses.csv", "condition_contrasts.csv", "coverage.csv",
+                     "analysis_manifest.json", "metrics.md", "hypotheses.md", "condition_contrasts.md",
+                     "coverage.md"):
+            assert (d / name).exists(), (variant, name)
+        manifest = json.loads((d / "analysis_manifest.json").read_text(encoding="utf-8"))
+        assert manifest["robustness_variant"] == variant
+        assert manifest["scope"]["samples"] == samples and manifest["scope"]["exclusions"]["applied"] is applied
+        hyp = pd.read_csv(d / "hypotheses.csv", dtype={"samples": str})
+        assert (hyp["samples"] == samples).all()
+        assert hyp["exclusions"].str.startswith("applied" if applied else "not applied").all()
+    # robustness writes no figures and does not touch the primary tables
+    assert not (tmp_path / "dry/figures").exists()
+    assert not (tmp_path / "dry/tables/metrics.csv").exists()
+    assert _run(dry_env, "robustness", "--all-samples") == 2
+
+
+def _point_review_sheet(cfg: Path, sheet: Path) -> None:
+    raw = analyze.yaml.safe_load(cfg.read_text(encoding="utf-8"))
+    raw["paths"]["review_sheet"] = str(sheet)
+    cfg.write_text(analyze.yaml.safe_dump(raw), encoding="utf-8")
+
+
+def test_all_skips_validations_without_inputs(dry_env: Path, tmp_path: Path,
+                                              capsys: pytest.CaptureFixture[str]) -> None:
+    _point_review_sheet(dry_env, tmp_path / "bench/review_sheet.csv")  # does not exist
+    assert _run(dry_env, "all") == 0
+    out = capsys.readouterr().out
+    for name in ("annotation-agreement", "human-agreement", "compare-judges"):
+        assert f"{name}: skipped: waiting for" in out
+    tables, figures = tmp_path / "dry/tables", tmp_path / "dry/figures"
+    for name in ("metrics.csv", "per_tier.csv", "hypotheses.csv", "robustness/all_samples/hypotheses.csv",
+                 "robustness/no_exclusions/metrics.csv"):
+        assert (tables / name).exists(), name
+    assert (figures / "hypotheses_forest.png").exists() and (figures / "summary_ALL_MODELS.png").exists()
+    assert not (tables / "human_judge_agreement.csv").exists()
+
+
+def test_all_runs_validations_whose_inputs_exist(dry_env: Path, tmp_path: Path,
+                                                 capsys: pytest.CaptureFixture[str]) -> None:
+    _point_review_sheet(dry_env, tmp_path / "bench/review_sheet.csv")
+    assert _run(dry_env, "export-human-sheet") == 0
+    _fill_ratings(tmp_path / "dry/tables/human_rating_sheet.csv", n=12, offset=0.02)
+    capsys.readouterr()
+    assert _run(dry_env, "all") == 0
+    out = capsys.readouterr().out
+    assert "human-agreement: skipped" not in out and "compare-judges: skipped: waiting for" in out
+    assert (tmp_path / "dry/tables/human_judge_agreement.csv").exists()
+    # an input that is present but unusable makes `all` fail (exit 2) after running the rest
+    sheet = tmp_path / "dry/tables/human_rating_sheet.csv"
+    df = pd.read_csv(sheet, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    df.loc[0, "rater_a_p_yes"] = "70"
+    df.to_csv(sheet, index=False, encoding="utf-8-sig")
+    assert _run(dry_env, "all") == 2
+    assert (tmp_path / "dry/tables/hypotheses.csv").exists()
+
+
+def test_input_hash_is_line_ending_independent(tmp_path: Path) -> None:
+    crlf, lf = tmp_path / "crlf.csv", tmp_path / "lf.csv"
+    crlf.write_bytes(b"a,b\r\n1,2\r\n")
+    lf.write_bytes(b"a,b\n1,2\n")
+    assert analyze.sha256_lf(crlf) == analyze.sha256_lf(lf) == analyze._sha256(lf)
+    assert analyze._sha256(crlf) != analyze._sha256(lf)
+
+
+def test_manifests_record_lf_hash_and_outputs_use_lf(dry_env: Path, tmp_path: Path) -> None:
+    results = tmp_path / "dry/results.csv"
+    expected = analyze.hashlib.sha256(results.read_bytes().replace(b"\r\n", b"\n")).hexdigest()
+    assert _run(dry_env, "metrics") == 0 and _run(dry_env, "hypotheses") == 0 and _run(dry_env, "robustness") == 0
+    tables = tmp_path / "dry/tables"
+    manifests = [tables / "analysis_manifest.json", tables / "hypotheses_manifest.json",
+                 *(tables / "robustness" / v / n for v in ("all_samples", "no_exclusions")
+                   for n in ("analysis_manifest.json", "hypotheses_manifest.json"))]
+    for path in manifests:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        assert manifest["input_sha256_lf"] == expected and "input_sha256" in manifest, path
+    written = [p for p in tables.rglob("*") if p.suffix in (".csv", ".md", ".json")]
+    assert written and all(b"\r\n" not in p.read_bytes() for p in written)
+
+
+def test_validation_inputs_detects_filled_columns(tmp_path: Path) -> None:
+    cfg_path, _, sheet_path = _annotation_env(tmp_path)
+    cfg, _ = analyze.load_settings(cfg_path)
+    paths = analyze.resolve_paths(cfg, True)
+    waiting = analyze.validation_inputs(cfg, paths)
+    assert all(v is not None for v in waiting.values())
+    sheet = pd.read_csv(sheet_path, dtype=str, keep_default_na=False, encoding="utf-8-sig")
+    sheet.loc[0, "a_notes"] = "notes alone do not count"
+    sheet.to_csv(sheet_path, index=False, encoding="utf-8-sig")
+    assert analyze.validation_inputs(cfg, paths)["annotation-agreement"] is not None
+    sheet.loc[0, "a_tier"] = "1"
+    sheet.to_csv(sheet_path, index=False, encoding="utf-8-sig")
+    assert analyze.validation_inputs(cfg, paths)["annotation-agreement"] is None
+    paths.second_scores.parent.mkdir(parents=True, exist_ok=True)
+    paths.second_scores.write_text("x\n", encoding="utf-8")
+    assert analyze.validation_inputs(cfg, paths)["compare-judges"] is None
