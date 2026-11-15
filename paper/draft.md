@@ -184,7 +184,7 @@ Calibration at T1 on the {{num:metrics:subject=ALL_MODELS;condition=default;tier
 **Limitations.**
 
 - *Benchmark.* The {{data:n_items:d}} items were drafted by an AI assistant and reviewed by a single author. Tiers were not labelled independently by a second annotator, so we report no inter-rater agreement for them. The benchmark is small and English only.
-- *Judge.* The prose reading J comes from one LLM judge. Agreement with a human rater and with a second LLM judge (Appendix D) cannot establish that J matches how real users read advice. The judge was used on Gemini's free tier, under which Google may use inputs and outputs to improve its products and human reviewers may read them; only public benchmark text and model outputs were sent.
+- *Judge.* The prose reading J comes from one LLM judge. Agreement with a human rater (Appendix D) cannot establish that J matches how real users read advice. The judge was used on Gemini's free tier, under which Google may use inputs and outputs to improve its products and human reviewers may read them; only public benchmark text and model outputs were sent.
 - *Subset judging.* For models other than qwen2.5-7b only sample 0 was judged, so prose-gap results rest on one sample per cell for those models.
 - *Unequal coverage.* Models differ in samples and coverage (Table 2): mistral-7b has one sample and phi-3.5-mini covers only part of the benchmark under contract_prompt. Pooled estimates therefore weight models unequally; the primary analysis restricts to sample 0 to limit this.
 - *Models.* We study {{agg:coverage::subject:nunique:d}} small default-prompted open-weights models, one of them AWQ-quantised (qwen2.5-7b); results may not transfer to other models, sizes or quantisation settings. With fewer than {{cfg:analysis.min_models_cross_model:d}} models we report no cross-model correlations.
@@ -303,19 +303,13 @@ The primary analysis uses sample 0 of every model and applies the item exclusion
 
 ## Appendix D. Judge validation
 
-The judge is compared with one human rater on {{cfg:analysis.human_rating_n:d}} stripped briefings (stratified by tier, rated blind) and with a second LLM judge from a different family ({{cfg:second_judge.model:s}}) on up to {{cfg:second_judge.n_briefings:d}} briefings (stratified by model and tier). Spearman correlations with bootstrap CIs over briefings:
+The judge is compared with one human rater on {{cfg:analysis.human_rating_n:d}} stripped briefings (stratified by tier, rated blind). Spearman correlations with bootstrap CIs over briefings:
 
 [CHECK: enable when human_judge_agreement.csv exists]
 
 <!-- Enable (move out of this comment) once results/tables/human_judge_agreement.csv exists, then add one sentence
 describing the agreement in words that match the CI:
 {{table:human_judge_agreement::comparison,n=d,spearman_rho=.2f,ci=.2f,mean_abs_diff=.3f}}
--->
-
-[CHECK: enable when judge_comparison.csv exists]
-
-<!-- Enable once results/tables/judge_comparison.csv exists, then add one sentence in words that match the CI:
-{{table:judge_comparison::comparison,n=d,spearman_rho=.2f,ci=.2f,mean_diff_J2_minus_J=+.3f}}
 -->
 
 [CHECK: enable when annotation_agreement.csv exists]

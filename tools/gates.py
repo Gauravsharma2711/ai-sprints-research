@@ -107,7 +107,6 @@ DRAFT_HEADINGS: tuple[tuple[str, tuple[str, ...]], ...] = (
 LIMITATIONS_HEADING = "Limitations and Dual-Use / Ethical Considerations"
 VALIDATION_TABLES: tuple[tuple[str, str], ...] = (
     ("human_judge_agreement.csv", "human ratings of the judge-validation sheet"),
-    ("judge_comparison.csv", "the second-judge run"),
     ("annotation_agreement.csv", "author item/tier labels"),
 )
 ANALYSIS_TABLES = ("hypotheses.csv", "coverage.csv", "data_quality.csv", "metrics.csv", "condition_contrasts.csv")
@@ -703,7 +702,7 @@ def g3_analysis_fresh(ctx: Ctx) -> GateResult:
 def g4_validation_tables(ctx: Ctx) -> GateResult:
     missing = [(n, why) for n, why in VALIDATION_TABLES if not (ctx.tables / n).exists()]
     if not missing:
-        return "PASS", "human_judge_agreement, judge_comparison, annotation_agreement present"
+        return "PASS", "human_judge_agreement, annotation_agreement present"
     return "BLOCKED", "missing " + "; ".join(f"{n} (waits for {why})" for n, why in missing)
 
 

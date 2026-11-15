@@ -143,7 +143,7 @@ Subjects are default-prompted open-weights instruct models served one at a time 
 
 Coverage is unequal: under `contract_prompt`, phi-3.5-mini covers at most {{agg:coverage:subject=phi-3.5-mini;condition=contract_prompt:n_items:max:d}} of {{data:n_items:d}} items. Free-tier judge capacity was limited, so sample 0 is judged for every model and the remaining samples only for qwen2.5-7b. Full coverage by condition and sample: [`results/tables/coverage.md`](results/tables/coverage.md).
 
-**Judge:** {{cfg:judge.model:s}} via Google's OpenAI-compatible endpoint, free tier (configured price {{cfg:judge.price_per_1m_input_usd:.2f}} USD per 1M input tokens), temperature {{cfg:judge.temperature:.1f}}, at most {{cfg:judge.max_tokens:d}} output tokens, reasoning effort `{{cfg:judge.reasoning_effort:s}}`. **Judge validation** (design; results go to Appendix C of the paper): a second LLM judge, {{cfg:second_judge.model:s}} ({{cfg:second_judge.provider:s}}, family `{{cfg:second_judge.family:s}}`), on {{cfg:second_judge.n_briefings:d}} briefings stratified by model and tier (sample in [`results/tables/second_judge_sample.csv`](results/tables/second_judge_sample.csv)), and a human rater on {{cfg:analysis.human_rating_n:d}} blind briefings stratified by tier ([`results/tables/human_rating_sheet.csv`](results/tables/human_rating_sheet.csv)).
+**Judge:** {{cfg:judge.model:s}} via Google's OpenAI-compatible endpoint, free tier (configured price {{cfg:judge.price_per_1m_input_usd:.2f}} USD per 1M input tokens), temperature {{cfg:judge.temperature:.1f}}, at most {{cfg:judge.max_tokens:d}} output tokens, reasoning effort `{{cfg:judge.reasoning_effort:s}}`. **Judge validation** (design; results in Appendix D of the paper when completed): a human rater on {{cfg:analysis.human_rating_n:d}} blind briefings stratified by tier ([`results/tables/human_rating_sheet.csv`](results/tables/human_rating_sheet.csv)).
 <!-- END GENERATED: models -->
 
 Llama-3.1-8B-Instruct is listed in `config.yaml` but was **dropped** (gated model access). All runs were made on Kaggle by the author with the notebook in
@@ -232,14 +232,6 @@ stopped. On the free tier Google may use inputs and outputs to improve its produ
 benchmark text and model outputs are sent. `budget.max_spend_usd` in `config.yaml` is enforced in
 code: paid calls past it are refused.
 
-**Second judge** (judge validation on a stratified subsample):
-
-```bash
-python -m src.analyze export-second-judge-sample
-python -m src.second_judge --approve
-python -m src.analyze compare-judges
-```
-
 ## Repository structure
 
 ```
@@ -252,7 +244,6 @@ src/
   clients.py                OpenAI-compatible client, retries, rate limits, budget, mock client
   benchmark.py              benchmark schema, validator, review-sheet export
   analyze.py                metrics, hypotheses, judge validation (item bootstrap)
-  second_judge.py           second-judge runner
 tools/
   build_paper.py            fills paper/draft.md from generated tables
   numbers_audit.py          checks every number in the built paper
@@ -279,7 +270,7 @@ of [`paper/draft.md`](paper/draft.md).
 
 - **Benchmark:** items were drafted by an AI assistant and reviewed by a single author; tiers were
   not independently labelled by a second annotator. Small and English only.
-- **Judge:** one LLM judge reads the prose. Validation against one human rater and a second LLM judge
+- **Judge:** one LLM judge reads the prose. Validation against one human rater
   (paper Appendix C) would not establish that it matches how real users read advice.
 - **Coverage:** models differ in samples and coverage (see [Models and runs](#models-and-runs)); the
   primary analysis uses sample 0 to limit this, and only qwen2.5-7b has all samples judged.
@@ -308,10 +299,10 @@ author's own ratings.
 | Repo scaffold: `CLAUDE.md`, `config.yaml`, `requirements.txt`, `.gitignore`, `.env.example` | Sprint | |
 | Benchmark: `data/benchmark/` (items, fixed turns, review sheet), `src/benchmark.py` | Sprint | Items drafted by Claude, reviewed by the author. |
 | Harness: `src/harness.py`, `src/prompts.py`, `src/parsing.py`, `src/clients.py` | Sprint | Prompt wording adapted from the playbook's templates. |
-| Judge choice | Sprint | The playbook planned xAI Grok; during the sprint the judge was changed to Google Gemini (free tier) after Groq's free-tier daily token limit proved too small. Every reported J comes from one Gemini model. |
+| Judge choice | Sprint | The playbook planned a different judge; during the sprint the judge was set to Google Gemini (free tier). Every reported J comes from one Gemini model. |
 | Kaggle runbook and notebook: `docs/kaggle_runbook.md`, `notebooks/kaggle_run.ipynb`, `tools/kaggle_sim/` | Sprint | Run on Kaggle by the author for qwen2.5-7b, phi-3.5-mini and mistral-7b. |
 | Runs and raw logs: `results/raw/` | Sprint | Subject runs on Kaggle; judge passes with Gemini. |
-| Analysis: `src/analyze.py`, `src/second_judge.py`, `tools/judge_subset.py`, `results/tables/`, `results/figures/` | Sprint | All tables and figures generated by scripts from `results/raw/`. |
+| Analysis: `src/analyze.py`, `tools/judge_subset.py`, `results/tables/`, `results/figures/` | Sprint | All tables and figures generated by scripts from `results/raw/`. |
 | Literature review: `docs/literature_notes.md`, `paper/references.md` | Sprint | |
 | Paper: `paper/draft.md`, `tools/build_paper.py`, `tools/numbers_audit.py`, `tools/export_prompts.py` | Sprint | |
 | README: `README.template.md`, `tools/build_readme.py` | Sprint | |

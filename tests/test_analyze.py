@@ -1,4 +1,4 @@
-"""Offline tests for src/analyze.py and src/second_judge.py.
+"""Offline tests for src/analyze.py.
 
 The small DataFrames below are test inputs with known answers (checking metric definitions),
 not results."""
@@ -15,7 +15,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src import analyze, prompts, second_judge
+from src import analyze, prompts
 from src.analyze import (
     METRIC_BY_NAME,
     POOLED,
@@ -34,7 +34,7 @@ from src.harness import main as harness_main
 from tests.test_harness import NO_FAILURES, Factory, write_config
 
 S = Settings(n_boot=2000, seed=1, ci=0.95, recovery_min_gap=0.10, log_clip=0.01, cross_condition="default",
-             min_models=5, human_n=30, second_n=150, sampling_seed=2)
+             min_models=5, human_n=30, sampling_seed=2)
 PROBS = ("c1", "c2A", "c2B", "c2N", "c3", "c3a", "c3b", "c3c", "c3N", "J", "L")
 
 
@@ -330,38 +330,6 @@ def test_human_agreement_rejects_out_of_range_ratings(dry_env: Path, tmp_path: P
     assert _run(dry_env, "human-agreement") == 2
 
 
-def test_second_judge_flow(dry_env: Path, tmp_path: Path) -> None:
-    assert _run(dry_env, "export-second-judge-sample") == 0
-    sample = pd.read_csv(tmp_path / "dry/tables/second_judge_sample.csv")
-    assert 0 < len(sample) <= 150
-    assert set(sample["subject"]) == {"llama-3.1-8b", "qwen2.5-7b"} and set(sample["tier"]) == {1, 2, 3}
-
-    factory = Factory(**NO_FAILURES)
-    assert second_judge.main(["--config", str(dry_env), "--dry-run"], mock_factory=factory) == 0
-    assert factory.calls == len(sample)
-    again = Factory(**NO_FAILURES)
-    assert second_judge.main(["--config", str(dry_env), "--dry-run"], mock_factory=again) == 0
-    assert again.calls == 0  # resumed: nothing left
-
-    assert _run(dry_env, "compare-judges") == 0
-    comp = pd.read_csv(tmp_path / "dry/tables/judge_comparison.csv")
-    assert comp.iloc[0]["comparison"] == "all" and comp.iloc[0]["n"] == len(sample)
-    log_dir = tmp_path / "dry/trajectories"
-    second = (log_dir / "second_judge.jsonl").read_text(encoding="utf-8")
-    assert second.count('"event": "call"') >= len(sample)
-    for model_file in ("llama-3.1-8b.jsonl", "qwen2.5-7b.jsonl"):  # second judge stays out of model files
-        assert '"second_judge"' not in (log_dir / model_file).read_text(encoding="utf-8")
-
-
-def test_second_judge_real_run_refuses_without_family_or_approval(dry_env: Path, tmp_path: Path) -> None:
-    factory = Factory(**NO_FAILURES)
-    assert second_judge.main(["--config", str(dry_env)], mock_factory=factory) == 2
-    assert factory.calls == 0
-
-
-# --- unbalanced data: different samples / items per model, pending judge --------------------
-
-
 def test_pooled_rows_weigh_models_equally_within_an_item() -> None:
     rows = [{"subject": "m1", "item_id": "A", "sample": k, "c1": 0.5, "c2A": 1.0} for k in range(3)]
     rows.append({"subject": "m2", "item_id": "A", "sample": 0, "c1": 0.5, "c2A": 0.5})
@@ -598,9 +566,6 @@ def test_human_sheet_uses_primary_samples_and_balances_models(dry_env: Path, tmp
         assert len(counts) == 2 and counts.max() - counts.min() <= 1
     assert _run(dry_env, "export-human-sheet", "--all-samples") == 2  # exports always use primary samples
 
-    assert _run(dry_env, "export-second-judge-sample") == 0
-    sample = pd.read_csv(tables / "second_judge_sample.csv")
-    assert set(sample["sample"]) == {0}
 
 
 def test_human_agreement_single_rater(dry_env: Path, tmp_path: Path) -> None:
@@ -708,7 +673,7 @@ def test_all_skips_validations_without_inputs(dry_env: Path, tmp_path: Path,
     _point_review_sheet(dry_env, tmp_path / "bench/review_sheet.csv")  # does not exist
     assert _run(dry_env, "all") == 0
     out = capsys.readouterr().out
-    for name in ("annotation-agreement", "human-agreement", "compare-judges"):
+    for name in ("annotation-agreement", "human-agreement"):
         assert f"{name}: skipped: waiting for" in out
     tables, figures = tmp_path / "dry/tables", tmp_path / "dry/figures"
     for name in ("metrics.csv", "per_tier.csv", "hypotheses.csv", "robustness/all_samples/hypotheses.csv",
@@ -726,7 +691,7 @@ def test_all_runs_validations_whose_inputs_exist(dry_env: Path, tmp_path: Path,
     capsys.readouterr()
     assert _run(dry_env, "all") == 0
     out = capsys.readouterr().out
-    assert "human-agreement: skipped" not in out and "compare-judges: skipped: waiting for" in out
+    assert "human-agreement: skipped" not in out
     assert (tmp_path / "dry/tables/human_judge_agreement.csv").exists()
     # an input that is present but unusable makes `all` fail (exit 2) after running the rest
     sheet = tmp_path / "dry/tables/human_rating_sheet.csv"
@@ -773,6 +738,3 @@ def test_validation_inputs_detects_filled_columns(tmp_path: Path) -> None:
     sheet.loc[0, "a_tier"] = "1"
     sheet.to_csv(sheet_path, index=False, encoding="utf-8-sig")
     assert analyze.validation_inputs(cfg, paths)["annotation-agreement"] is None
-    paths.second_scores.parent.mkdir(parents=True, exist_ok=True)
-    paths.second_scores.write_text("x\n", encoding="utf-8")
-    assert analyze.validation_inputs(cfg, paths)["compare-judges"] is None

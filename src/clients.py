@@ -37,7 +37,7 @@ class ChatRequest:
     max_tokens: int
     seed: int | None = None
     top_logprobs: int | None = None  # if set, ask for logprobs of generated tokens
-    reasoning_effort: str | None = None  # reasoning models only (e.g. Gemini, gpt-oss); None = omit
+    reasoning_effort: str | None = None  # reasoning models only (e.g. Gemini); None = omit
 
     def to_payload(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -106,7 +106,7 @@ class ChatClient(Protocol):
 
 
 # ---------------------------------------------------------------------------
-# OpenAI-compatible client (vLLM, xAI, Groq)
+# OpenAI-compatible client (vLLM, Gemini)
 # ---------------------------------------------------------------------------
 
 

@@ -73,21 +73,6 @@ judge:
     requests_per_day: null
     tokens_per_day: null
 
-second_judge:
-  provider: groq
-  base_url: https://api.groq.com/openai/v1
-  api_key_env: GROQ_API_KEY
-  model: openai/gpt-oss-120b   # free tier; differs from the primary judge (Gemini) and every subject
-  family: openai
-  temperature: 0.0
-  max_tokens: 300              # reasoning model: needs room for hidden reasoning (a Groq test call used ~80)
-  n_briefings: 150             # stratified by model x tier
-  # Self-imposed caps. Set these at or below the limits shown in the Groq console for the chosen model.
-  rate_limits:
-    requests_per_minute: 30
-    tokens_per_minute: 6000
-    requests_per_day: 1000
-    tokens_per_day: 200000
 
 # ---------------------------------------------------------------------------
 # Sampling
@@ -102,7 +87,6 @@ sampling:
 concurrency:
   subject: 8                   # parallel requests to the local vLLM server
   judge: 2
-  second_judge: 1
 
 retries:
   max_attempts: 4              # tenacity, for transport errors only (not parse failures)
@@ -124,11 +108,10 @@ paths:
   benchmark: data/benchmark/items.jsonl
   turns: data/benchmark/turns.yaml
   review_sheet: data/benchmark/review_sheet.csv
-  raw_log_dir: results/raw/trajectories/   # one JSONL per model (+ second_judge, _runs): each file < GitHub's 100 MB
+  raw_log_dir: results/raw/trajectories/   # one JSONL per model (+ _runs): each file < GitHub's 100 MB
   results_csv: results/raw/results.csv
   tables: results/tables/
   figures: results/figures/
-  second_judge_scores: results/raw/second_judge_scores.csv
   dry_run_dir: results/dry_run/   # mock-client output; gitignored, never used for results
 
 # ---------------------------------------------------------------------------
@@ -147,4 +130,4 @@ analysis:
   cross_model_condition: default
   min_models_cross_model: 5     # warn below this; cross-model outputs only with --cross-model
   human_rating_n: 30            # stratified by tier
-  sampling_seed: 20261116       # for choosing human-rating and second-judge briefings
+  sampling_seed: 20261116       # for choosing the human-rating briefings

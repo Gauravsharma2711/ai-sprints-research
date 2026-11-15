@@ -15,7 +15,7 @@ specified the fixes.
    or paper must be computed by code from logged runs in `results/raw/`. No placeholder numbers in
    output files. If data is missing, the output says it is missing.
 2. **Every model call is logged to raw JSONL** (`results/raw/trajectories/`, one append-only file per
-   subject model plus `second_judge.jsonl` and `_runs.jsonl`, so no file exceeds GitHub's 100 MB
+   subject model plus `_runs.jsonl`, so no file exceeds GitHub's 100 MB
    limit; this replaces the playbook's single `trajectories.jsonl`): subject,
    judge and probe calls alike, including failures and retries. Each record holds at least a timestamp,
    run id, model id, base_url, arm, item id, condition, sample index, full request messages, sampling
@@ -36,7 +36,7 @@ specified the fixes.
 
 ## Further rules from the plan
 
-- All model endpoints go through the `openai` client with a configurable `base_url` (vLLM, xAI, Groq).
+- All model endpoints go through the `openai` client with a configurable `base_url` (vLLM for subjects, Gemini for the judge).
   Read endpoints, model ids and limits from `config.yaml`; do not hardcode them in code.
 - Confidence convention: every probability is P(answer is YES), parsed from `PROBABILITY_YES: <x>`.
 - The judge must be from a different model family than every subject; enforce this in code.

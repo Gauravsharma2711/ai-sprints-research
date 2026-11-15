@@ -34,7 +34,7 @@ WHITELIST_CONFIG_PATHS: tuple[str, ...] = (
     "sampling.temperature", "sampling.max_tokens", "sampling.samples_per_cell", "sampling.seed",
     "sampling.probe_top_logprobs",
     "judge.temperature", "judge.max_tokens",
-    "second_judge.temperature", "second_judge.max_tokens", "second_judge.n_briefings",
+    
     "analysis.bootstrap_resamples", "analysis.bootstrap_seed", "analysis.ci_level",
     "analysis.recovery_min_gap", "analysis.log_score_clip", "analysis.min_models_cross_model",
     "analysis.human_rating_n", "analysis.sampling_seed",

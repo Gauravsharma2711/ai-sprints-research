@@ -12,8 +12,6 @@ Commands (add --dry-run to read the mock-client output in results/dry_run/ inste
     python -m src.analyze annotation-agreement        # review_sheet a_* labels vs drafted labels
     python -m src.analyze export-human-sheet          # 30 blind briefings for the raters
     python -m src.analyze human-agreement             # once the ratings are filled in (1 or 2 raters)
-    python -m src.analyze export-second-judge-sample  # 150 briefings for the second judge
-    python -m src.analyze compare-judges              # after `python -m src.second_judge`
 Flags: --all-samples (robustness), --no-exclusions (robustness), --cross-model (only with >= a few
 models; off by default).
 
@@ -115,7 +113,6 @@ class Settings:
     cross_condition: str
     min_models: int
     human_n: int
-    second_n: int
     sampling_seed: int
     primary_samples: tuple[int, ...] = (0,)
     exclusions_csv: str = ""  # resolved path; "" = no exclusions file configured
@@ -147,7 +144,6 @@ def load_settings(config_path: Path) -> tuple[HarnessConfig, Settings]:
             cross_condition=str(a["cross_model_condition"]),
             min_models=int(a["min_models_cross_model"]),
             human_n=int(a["human_rating_n"]),
-            second_n=int(raw["second_judge"]["n_briefings"]),
             sampling_seed=int(a["sampling_seed"]),
             primary_samples=_primary_samples(a.get("primary_samples")),
             exclusions_csv=excl_path,
@@ -164,7 +160,6 @@ class Paths:
     log: Path
     tables: Path
     figures: Path
-    second_scores: Path
 
     @property
     def human_sheet(self) -> Path:
@@ -178,22 +173,17 @@ class Paths:
     def human_instructions(self) -> Path:
         return self.tables / "human_rating_instructions.md"
 
-    @property
-    def second_sample(self) -> Path:
-        return self.tables / "second_judge_sample.csv"
-
 
 def resolve_paths(cfg: HarnessConfig, dry_run: bool, out_dir: Path | None = None) -> Paths:
     if dry_run:
         base = cfg.paths["dry_run_dir"]
         paths = Paths(True, base / "results.csv", base / "trajectories", base / "tables",
-                      base / "figures", base / "second_judge_scores.csv")
+                      base / "figures")
     else:
         paths = Paths(False, cfg.paths["results_csv"], cfg.paths["raw_log_dir"], cfg.paths["tables"],
-                      cfg.paths["figures"], cfg.paths["second_judge_scores"])
+                      cfg.paths["figures"])
     if out_dir is not None:
-        paths = Paths(paths.dry_run, paths.results, paths.log, out_dir / "tables", out_dir / "figures",
-                      paths.second_scores)
+        paths = Paths(paths.dry_run, paths.results, paths.log, out_dir / "tables", out_dir / "figures")
     return paths
 
 
@@ -1109,33 +1099,6 @@ def export_human_sheet(df: pd.DataFrame, briefings: pd.DataFrame, s: Settings, p
     return [paths.human_sheet, paths.human_key, paths.human_instructions]
 
 
-def export_second_judge_sample(df: pd.DataFrame, briefings: pd.DataFrame, s: Settings, paths: Paths,
-                               force: bool) -> list[Path]:
-    if paths.second_sample.exists() and paths.second_scores.exists() and not force:
-        raise ConfigError(f"{paths.second_scores} already exists for the current sample; refusing to "
-                          "replace the sample (use --force to resample)")
-    eligible = _eligible_briefings(df, briefings, s)
-    rng = np.random.default_rng(s.sampling_seed + 1)
-    cells = [(subj, tier) for subj in sorted(eligible["subject"].unique()) for tier in (1, 2, 3)]
-    if not cells:
-        raise ConfigError("no eligible briefings (judge status ok) in the log")
-    quotas = [s.second_n // len(cells) + (1 if k < s.second_n % len(cells) else 0) for k in range(len(cells))]
-    picks = []
-    for (subj, tier), q in zip(cells, quotas):
-        pool = eligible[(eligible["subject"] == subj) & (eligible["tier"] == tier)]
-        p = _pick(pool, q, rng)
-        if len(p) < q:
-            print(f"  WARNING: only {len(p)} eligible briefings for {subj} tier {tier} (wanted {q})")
-        picks.append(p)
-    chosen = pd.concat(picks).reset_index(drop=True)
-    width = max(3, len(str(len(chosen))))
-    chosen["briefing_id"] = [f"S{k + 1:0{width}d}" for k in range(len(chosen))]
-    out = chosen[["briefing_id", *KEY, "tier", "question", "briefing"]]
-    paths.tables.mkdir(parents=True, exist_ok=True)
-    out.to_csv(paths.second_sample, index=False, encoding="utf-8", lineterminator="\n")
-    return [paths.second_sample]
-
-
 # ---------------------------------------------------------------------------
 # Agreement statistics
 # ---------------------------------------------------------------------------
@@ -1264,35 +1227,6 @@ def human_agreement(paths: Paths, s: Settings) -> list[Path]:
                         [f"rater setup: {setup}", f"Spearman CI: {s.ci:.0%} bootstrap over briefings"])
     print(table[["comparison", "n", "spearman_rho", "ci_low", "ci_high", "mean_abs_diff"]].to_string(index=False))
     return [out, md]
-
-
-def compare_judges(df: pd.DataFrame, paths: Paths, s: Settings) -> list[Path]:
-    if not paths.second_scores.exists():
-        raise ConfigError(f"no second-judge scores at {paths.second_scores}; run `python -m src.second_judge`")
-    scores = pd.read_csv(paths.second_scores, dtype={"item_id": str, "subject": str, "condition": str})
-    scores["J2"] = pd.to_numeric(scores["J2"], errors="coerce")
-    merged = scores.merge(df[[*KEY, "J"]], on=KEY, how="left")
-    both = merged[merged["J"].notna() & merged["J2"].notna()]
-    print(f"  second-judge rows: {len(scores)}; NaN J2: {int(scores['J2'].isna().sum())}; "
-          f"paired with primary judge: {len(both)}")
-    models = ",".join(sorted(scores["judge2_model"].astype(str).unique()))
-    rows = [_agreement_row("all", both["J"].to_numpy(float), both["J2"].to_numpy(float), s,
-                           second_judge=models)]
-    for tier in (1, 2, 3):
-        t = both[both["tier"] == tier]
-        rows.append(_agreement_row(f"tier {tier}", t["J"].to_numpy(float), t["J2"].to_numpy(float), s,
-                                   second_judge=models))
-    for subject in sorted(both["subject"].unique()):
-        t = both[both["subject"] == subject]
-        rows.append(_agreement_row(f"subject {subject}", t["J"].to_numpy(float), t["J2"].to_numpy(float),
-                                   s, second_judge=models))
-    out = paths.tables / "judge_comparison.csv"
-    paths.tables.mkdir(parents=True, exist_ok=True)
-    table = pd.DataFrame(rows).rename(columns={"mean_diff_y_minus_x": "mean_diff_J2_minus_J"})
-    table.to_csv(out, index=False, lineterminator="\n")
-    print(table[["comparison", "n", "spearman_rho", "ci_low", "ci_high", "mean_diff_J2_minus_J"]]
-          .to_string(index=False))
-    return [out]
 
 
 # ---------------------------------------------------------------------------
@@ -1725,7 +1659,6 @@ def validation_inputs(cfg: HarnessConfig, paths: Paths, annotator: str = "a") ->
                                  else f"{', '.join(label_cols)} in {sheet}"),
         "human-agreement": (None if _filled(paths.human_sheet, ["rater_a_p_yes"])
                             else f"rater_a_p_yes in {paths.human_sheet}"),
-        "compare-judges": None if paths.second_scores.exists() else str(paths.second_scores),
     }
 
 
@@ -1748,16 +1681,11 @@ def run_all(cfg: HarnessConfig, s: Settings, paths: Paths, *, cross: bool = Fals
             ("hypotheses (table, forest figure)", lambda: run_hypotheses(loaded, s, paths)),
             ("robustness", lambda: run_robustness(loaded, s, paths)),
         ]
-    def loaded_or_fail() -> pd.DataFrame:
-        if df is None:
-            raise ConfigError("results could not be loaded")
-        return df
 
     waiting = validation_inputs(cfg, paths, annotator)
     validators: dict[str, Any] = {
         "annotation-agreement": lambda: annotation_agreement(cfg, s, paths, annotator),
         "human-agreement": lambda: human_agreement(paths, s),
-        "compare-judges": lambda: compare_judges(loaded_or_fail(), paths, s),
     }
     for name, fn in steps:
         print(f"== all: {name}")
@@ -1784,7 +1712,7 @@ def run_all(cfg: HarnessConfig, s: Settings, paths: Paths, *, cross: bool = Fals
 # ---------------------------------------------------------------------------
 
 COMMANDS = ("metrics", "hypotheses", "robustness", "per-tier", "all", "annotation-agreement",
-            "export-human-sheet", "human-agreement", "export-second-judge-sample", "compare-judges")
+            "export-human-sheet", "human-agreement")
 SCOPED_COMMANDS: tuple[str, ...] = ("metrics", "hypotheses", "per-tier")
 
 
@@ -1850,13 +1778,9 @@ def main(argv: list[str] | None = None) -> int:
                                        use_exclusions=not args.no_exclusions)
             elif args.command == "robustness":
                 written = run_robustness(df, s, paths)
-            elif args.command in ("export-human-sheet", "export-second-judge-sample"):
+            else:  # export-human-sheet
                 df_excl, _, _ = apply_scope(df, s, all_samples=False, use_exclusions=not args.no_exclusions)
-                exporter = (export_human_sheet if args.command == "export-human-sheet"
-                            else export_second_judge_sample)
-                written = exporter(df_excl, load_judge_briefings(paths.log), s, paths, args.force)
-            else:
-                written = compare_judges(df, paths, s)
+                written = export_human_sheet(df_excl, load_judge_briefings(paths.log), s, paths, args.force)
     except ConfigError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
