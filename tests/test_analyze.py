@@ -738,3 +738,187 @@ def test_validation_inputs_detects_filled_columns(tmp_path: Path) -> None:
     sheet.loc[0, "a_tier"] = "1"
     sheet.to_csv(sheet_path, index=False, encoding="utf-8-sig")
     assert analyze.validation_inputs(cfg, paths)["annotation-agreement"] is None
+
+
+# --- bootstrap p, Holm, first-attempt restriction, per-paraphrase, figures ---------------------
+
+
+def test_bootstrap_p_bounds_and_ci_unchanged() -> None:
+    n_boot = 1000
+    assert analyze.bootstrap_p(np.full(n_boot, 0.3), n_boot) == pytest.approx(1 / n_boot)  # floored
+    assert analyze.bootstrap_p(np.array([-1.0, 1.0] * 50), 100) == pytest.approx(1.0)  # capped at 1
+    assert analyze.bootstrap_p(np.array([-1.0, 1.0, 1.0, 1.0]), 4) == pytest.approx(0.5)
+    assert math.isnan(analyze.bootstrap_p(np.array([math.nan]), 10))
+    rng = np.random.default_rng(3)
+    for shift in (0.0, 0.2, -0.5, 2.0):
+        a = rng.normal(loc=shift, size=30)
+        est, lo, hi, p = analyze.bootstrap_with_p("mean", a, None, n_boot=n_boot, seed=4, ci=0.95)
+        assert (est, lo, hi) == bootstrap("mean", a, None, n_boot=n_boot, seed=4, ci=0.95)
+        assert 1 / n_boot <= p <= 1.0
+        if abs(p - 0.05) > 0.02:  # away from the boundary, percentile CI and p agree
+            assert (p < 0.05) == (lo > 0 or hi < 0)
+    assert math.isnan(analyze.bootstrap_with_p("mean", np.array([0.2]), None, n_boot=10, seed=1, ci=0.95)[3])
+
+
+def test_holm_adjust_known_values_and_monotone() -> None:
+    raw = [0.01, 0.04, 0.03, math.nan, 0.5]
+    adj = analyze.holm_adjust(raw)
+    # m = 4 finite: sorted 0.01, 0.03, 0.04, 0.5 -> 0.04, 0.09, max(0.09, 0.08) = 0.09, 0.5
+    assert adj[0] == pytest.approx(0.04) and adj[2] == pytest.approx(0.09) and adj[1] == pytest.approx(0.09)
+    assert adj[4] == pytest.approx(0.5) and math.isnan(adj[3])
+    rng = np.random.default_rng(0)
+    p = rng.uniform(0, 0.2, size=12).tolist()
+    a = analyze.holm_adjust(p)
+    order = np.argsort(p)
+    assert all(a[k] >= p[k] for k in range(len(p))) and all(v <= 1.0 for v in a)
+    assert all(a[order[k]] <= a[order[k + 1]] for k in range(len(p) - 1))
+
+
+def test_sign_verdict_rules() -> None:
+    v = analyze.sign_verdict
+    assert v(0.2, 0.01, ">0", 0.05) == "supported" and v(-0.2, 0.01, ">0", 0.05) == "opposite"
+    assert v(0.2, 0.2, ">0", 0.05) == "inconclusive" and v(-0.2, 0.01, "!=0", 0.05) == "supported"
+    assert v(math.nan, 0.01, ">0", 0.05) == "no data" and v(0.2, math.nan, "<0", 0.05) == "inconclusive"
+
+
+def test_hypotheses_have_p_boot_and_holm_on_pooled_rows_only() -> None:
+    h = _hyp_frame()
+    assert list(h.columns) == list(analyze.HYPOTHESIS_COLUMNS)
+    assert list(h.columns[-3:]) == ["p_boot", "holm_p", "holm_verdict"]
+    per_model = h[h.subject != POOLED]
+    assert per_model["holm_p"].isna().all() and (per_model["holm_verdict"] == "").all()
+    pooled = h[h.subject == POOLED]
+    finite = pooled[pooled["p_boot"].notna()]
+    assert len(finite) and (finite["holm_p"] >= finite["p_boot"] - 1e-12).all()
+    assert ((finite["p_boot"] >= 1 / 500) & (finite["p_boot"] <= 1)).all()
+    assert set(pooled["holm_verdict"]) <= {"supported", "opposite", "inconclusive", "no data"}
+    expected = analyze.holm_adjust(pooled["p_boot"].tolist())
+    np.testing.assert_allclose(pooled["holm_p"].to_numpy(dtype=float), expected)
+
+
+def _first_attempt_frame() -> pd.DataFrame:
+    """Items I1-I4: bluff moves c2A by 0.3 on first-attempt cells, by 0.0 on re-asked cells (I3, I4
+    have status_T2A = reask_ok). The neutral turn never moves. I1's T3a was re-asked."""
+    rows = []
+    for k in range(1, 5):
+        reask = k >= 3
+        rows.append({"item_id": f"I{k}", "c1": 0.5, "c2A": 0.5 if reask else 0.8, "c2N": 0.5,
+                     "c3": 0.6, "c3N": 0.5, "c3a": 0.6, "c3b": 0.6, "c3c": 0.6, "c2B": 0.7,
+                     "status_T2A": "reask_ok" if reask else "ok",
+                     "status_T3a": "reask_ok" if k == 1 else "ok"})
+    return frame(*rows)
+
+
+def test_first_attempt_restriction_drops_reasked_cells() -> None:
+    s = _settings()
+    _, analysed, scope = analyze.apply_scope(_first_attempt_frame(), s, all_samples=False, use_exclusions=True)
+    d = add_row_metrics(analysed, s)
+    full = analyze.compute_hypotheses(d, s, scope)
+    fa = analyze.compute_hypotheses(d, s, scope, first_attempt=True)
+    assert list(fa.columns) == list(analyze.FIRST_ATTEMPT_COLUMNS)
+    assert list(fa.columns) == [*analyze.HYPOTHESIS_COLUMNS, "restriction"]
+    assert (fa["restriction"] == "first-attempt parses only").all()
+    assert set(fa["hypothesis"]) == set(analyze.FIRST_ATTEMPT_HYPOTHESES)  # no H1
+
+    def row(t: pd.DataFrame, metric: str) -> pd.Series:
+        return t[(t.metric == metric) & (t.subject == POOLED) & (t.comparison == "default")].iloc[0]
+
+    assert row(full, "net_bluff_shift").estimate == pytest.approx(0.15) and row(full, "net_bluff_shift").n_items == 4
+    h2 = row(fa, "net_bluff_shift")
+    assert h2.estimate == pytest.approx(0.3) and h2.n_items == 2 and h2.n_cells == 2
+    assert row(fa, "excess_hysteresis_abs").n_items == 4  # T2A status does not enter H4
+    assert row(fa, "ablation_T3a_minus_T3").n_items == 3
+    assert row(fa, "ablation_T3b_minus_T3").n_items == 4
+    assert set(analyze.METRIC_ARMS) >= set(fa["metric"])
+    per_model = fa[fa.subject != POOLED]
+    assert per_model["holm_p"].isna().all() and (per_model["holm_verdict"] == "").all()
+
+
+def test_first_attempt_keeps_model_rows_with_no_cells_left() -> None:
+    s = _settings()
+    df = _first_attempt_frame()
+    df2 = df.assign(subject="m2", status_T2A="reask_ok")
+    _, analysed, scope = analyze.apply_scope(pd.concat([df, df2], ignore_index=True), s, all_samples=False,
+                                             use_exclusions=True)
+    fa = analyze.compute_hypotheses(add_row_metrics(analysed, s), s, scope, first_attempt=True)
+    m2 = fa[(fa.subject == "m2") & (fa.metric == "net_bluff_shift")].iloc[0]
+    assert m2.n_items == 0 and m2.verdict == "no data"
+
+
+def _paraphrase_frame() -> pd.DataFrame:
+    """m1: samples 0-2 (paraphrase = sample), bluff shift 0.1 x (k + 1) for paraphrase k;
+    m2: sample 0 only, bluff shift 0.5."""
+    rows = []
+    for item in ("I1", "I2", "I3"):
+        for k in range(3):
+            rows.append({"subject": "m1", "item_id": item, "sample": k, "paraphrase_idx": k, "c1": 0.5,
+                         "c2A": 0.5 + 0.1 * (k + 1), "c2N": 0.5, "c3": 0.6, "c3N": 0.55, "c3a": 0.5,
+                         "c3b": 0.6, "c3c": 0.7, "c2B": 0.6})
+        rows.append({"subject": "m2", "item_id": item, "sample": 0, "paraphrase_idx": 0, "c1": 0.4,
+                     "c2A": 0.9, "c2N": 0.4})
+    return frame(*rows)
+
+
+def test_per_paraphrase_table() -> None:
+    s = _settings()
+    _, analysed, scope = analyze.apply_scope(_paraphrase_frame(), s, all_samples=True, use_exclusions=True)
+    t = analyze.compute_per_paraphrase(add_row_metrics(analysed, s), s, scope)
+    assert list(t.columns) == ["subject", "condition", "paraphrase_idx", "metric", "estimate", "ci_low", "ci_high",
+                               "n_items", "n_cells", "exclusions"]
+    assert set(t["subject"]) == {"m1", POOLED}  # m2 has one paraphrase only
+    assert set(t["metric"]) == set(analyze.PER_PARAPHRASE_METRICS)
+    assert set(t["paraphrase_idx"]) == {0, 1, 2}
+
+    def est(subject: str, k: int, metric: str = "bluff_shift") -> pd.Series:
+        return t[(t.subject == subject) & (t.paraphrase_idx == k) & (t.metric == metric)].iloc[0]
+
+    for k in range(3):
+        assert est("m1", k).estimate == pytest.approx(0.1 * (k + 1)) and est("m1", k).n_cells == 3
+    p0 = est(POOLED, 0)  # m1 (0.1) and m2 (0.5), models averaged within item
+    assert p0.estimate == pytest.approx(0.3) and p0.n_cells == 6 and p0.n_items == 3
+    assert est(POOLED, 2).estimate == pytest.approx(0.3) and est(POOLED, 2).n_cells == 3
+    assert est("m1", 1, "ablation_T3c_minus_T3").estimate == pytest.approx(0.1)
+
+
+def test_summary_and_forest_figures(tmp_path: Path) -> None:
+    from PIL import Image
+
+    s = _settings()
+    _, analysed, scope = analyze.apply_scope(_unbalanced(), s, all_samples=False, use_exclusions=True)
+    m = compute_metrics(add_row_metrics(analysed, s), s)
+    out = tmp_path / "summary.png"
+    analyze.plot_summary(m, POOLED, ["m1", "m2"], analyze.conditions_in(analysed), out, "", 0.95,
+                         analyze.plain_samples(scope.samples))
+    title = analyze.summary_title(POOLED, ["m1", "m2", "m3"], "sample 0", "")
+    assert title == "Pooled over three models, all evidence tiers, sample 0"
+    assert POOLED not in title and "samples=" not in title
+    assert analyze.plain_samples("all") == "all samples" and analyze.plain_samples("0,1") == "samples 0, 1"
+    assert analyze.FIG_MIN_FONT >= 10
+    forest = tmp_path / "forest.png"
+    analyze.plot_forest(_hyp_frame(), forest, "", 0.95)
+    for path in (out, forest):
+        with Image.open(path) as img:
+            assert img.info["dpi"][0] == pytest.approx(300, abs=1)
+    with Image.open(forest) as img:
+        assert img.size[0] > img.size[1]  # landscape
+    assert analyze.forest_label("H2", "net_bluff_shift", "default") == "Net bluff shift (H2)"
+    assert analyze.forest_label("H5", "ablation_T3a_minus_T3", "default") == "Neutral-placeholder ablation T3a (H5)"
+
+
+def test_all_writes_per_paraphrase_and_first_attempt(dry_env: Path, tmp_path: Path) -> None:
+    _point_review_sheet(dry_env, tmp_path / "bench/review_sheet.csv")
+    assert _run(dry_env, "all") == 0
+    tables = tmp_path / "dry/tables"
+    pp = pd.read_csv(tables / "per_paraphrase.csv")
+    assert list(pp.columns) == list(analyze.PER_PARAPHRASE_COLUMNS)
+    assert set(pp["paraphrase_idx"]) == {0, 1} and (tables / "per_paraphrase.md").exists()
+    fa = pd.read_csv(tables / "hypotheses_first_attempt.csv", keep_default_na=False)
+    assert list(fa.columns) == list(analyze.FIRST_ATTEMPT_COLUMNS) and (tables / "hypotheses_first_attempt.md").exists()
+    manifest = json.loads((tables / "hypotheses_manifest.json").read_text(encoding="utf-8"))
+    assert manifest["multiple_comparisons"]["family"] == analyze.HOLM_FAMILY
+    for variant in ("all_samples", "no_exclusions"):
+        rob = pd.read_csv(tables / "robustness" / variant / "hypotheses.csv")
+        assert list(rob.columns) == list(analyze.HYPOTHESIS_COLUMNS)
+    fa_manifest = json.loads((tables / "hypotheses_first_attempt_manifest.json").read_text(encoding="utf-8"))
+    assert fa_manifest["metric_arms"]["net_bluff_shift"] == ["T1", "T2A", "T2N"]
+    assert _run(dry_env, "per-paraphrase", "--no-exclusions") == 2
