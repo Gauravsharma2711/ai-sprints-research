@@ -22,6 +22,16 @@ Placeholders (one line each, ``{{kind:...}}``; fields separated by ``:``):
     {{include:<file in the draft's directory>}}       verbatim inclusion (e.g. appendix_prompts.md)
     {{defaults:<table>:<filters>}}                    extra filters for every lookup in <table>
                                                       (a placeholder's own key wins); line removed
+    {{refs}}                                          reference list: the references.md entry of
+                                                      every key cited anywhere in the draft, sorted
+
+A format may end in ``?<text>`` (e.g. ``.3f?–``): a missing value then renders as <text>, with no
+warning, instead of ``n/a``; in a pivot with ``estimate+ci`` a missing estimate renders <text> alone.
+
+Citations: ``[CITE:k1,k2]`` renders as author-year text, e.g. "(Shnaidman, 2026; Ma et al., 2026)",
+from the entries in references.md (next to the draft unless --refs is given). A cited key with no
+entry is a build error. With --final, a citation whose keys are not all marked CONFIRMED is left as
+the marker and fails the build; in normal builds every entry is rendered.
 
 Filters: ``key=value;key=value``; ``key=a|b`` matches either value (and orders table rows/pivot
 axes in that order). An empty filter matches every row. ``num``/``ci`` must match exactly one row.
@@ -29,8 +39,8 @@ HTML comments (``<!-- ... -->``) in the draft are dropped before placeholders ar
 
 Usage (from the repo root):
     python tools/build_paper.py                    # results/tables -> paper/paper.md, .docx, numbers_used.csv
-    python tools/build_paper.py --final            # also fail on [CITE:...], [RESULT PROSE ...] etc.
-    python tools/build_paper.py --tables T --figures F --out-dir D --draft paper/draft.md
+    python tools/build_paper.py --final            # also fail on unconfirmed citations, [CHECK ...] etc.
+    python tools/build_paper.py --tables T --figures F --out-dir D --draft paper/draft.md --refs R
 """
 
 from __future__ import annotations
@@ -96,12 +106,15 @@ class BuildContext:
     draft_dir: Path
     out_dir: Path
     allow_dry_run: bool = False
+    refs_path: Path | None = None   # default: <draft_dir>/references.md
+    final: bool = False             # set by build(); unconfirmed citations stay as markers
     used: list[UsedNumber] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     defaults: dict[str, dict[str, list[str]]] = field(default_factory=dict)
     _tables: dict[str, Table] = field(default_factory=dict)
     _config: dict[str, Any] | None = None
     _facts: dict[str, int] | None = None
+    _refs: dict[str, RefEntry] | None = None
 
     # -- sources ---------------------------------------------------------------------------
     def table(self, name: str) -> Table:
@@ -128,6 +141,17 @@ class BuildContext:
         if self._facts is None:
             self._facts = data_facts(self.config_path)
         return self._facts
+
+    def references_path(self) -> Path:
+        return self.refs_path if self.refs_path is not None else self.draft_dir / "references.md"
+
+    def references(self) -> dict[str, RefEntry]:
+        if self._refs is None:
+            path = self.references_path()
+            if not path.is_file():
+                raise BuildError(f"references file not found at {path}")
+            self._refs = parse_references(path.read_text(encoding="utf-8"))
+        return self._refs
 
     def rel(self, path: Path) -> str:
         try:
@@ -223,6 +247,109 @@ def data_facts(config_path: Path) -> dict[str, int]:
 
 
 # ---------------------------------------------------------------------------------------------
+# References and citations
+# ---------------------------------------------------------------------------------------------
+
+CITE_RE = re.compile(r"\[CITE:(?P<keys>[^\]]*)\]")
+REF_ENTRY_RE = re.compile(r"^\s*[-*]\s*\[(?P<key>[^\]]+)\]\s*(?P<text>.*\S)\s*$")
+CONFIRMED_RE = re.compile(r"(?<![A-Za-z])CONFIRMED\b")  # 'UNCONFIRMED' does not count
+YEAR_RE = re.compile(r"\((?P<year>\d{4}[a-z]?)\)")
+
+
+@dataclass(frozen=True)
+class RefEntry:
+    key: str
+    text: str        # entry text without the leading [key]
+    confirmed: bool
+    line: int        # 0-based line in references.md
+
+
+def parse_references(text: str) -> dict[str, RefEntry]:
+    """``- [key] Entry text`` lines of references.md (HTML comments ignored)."""
+    out: dict[str, RefEntry] = {}
+    clean = COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+    for n, line in enumerate(clean.split("\n")):
+        m = REF_ENTRY_RE.match(line)
+        if m:
+            key = m.group("key").strip()
+            out[key] = RefEntry(key, m.group("text"), bool(CONFIRMED_RE.search(m.group("text"))), n)
+    return out
+
+
+def cite_keys(marker_body: str) -> list[str]:
+    return [k.strip() for k in marker_body.split(",") if k.strip()]
+
+
+def cited_keys(text: str) -> list[str]:
+    """Every key cited in ``text`` (HTML comments ignored), in order of first citation."""
+    keys: list[str] = []
+    for m in CITE_RE.finditer(COMMENT_RE.sub("", text)):
+        for k in cite_keys(m.group("keys")):
+            if k not in keys:
+                keys.append(k)
+    return keys
+
+
+def author_year(entry: RefEntry) -> str:
+    """'Shnaidman, 2026', 'Kim & Khashabi, 2025' or 'Ma et al., 2026' from an author-year entry."""
+    m = YEAR_RE.search(entry.text)
+    if m is None:
+        raise BuildError(f"reference {entry.key!r}: no '(YYYY)' year in the entry")
+    authors = entry.text[:m.start()].strip().rstrip(",")
+    et_al = bool(re.search(r"\bet al\.?", authors))
+    authors = re.sub(r",?\s*\bet al\.?", "", authors)
+    authors = re.sub(r",?\s*&\s*", ", ", authors)
+    parts = [p.strip() for p in authors.split(", ") if p.strip()]
+    surnames = parts[0::2]  # "Surname, Initials, Surname, Initials, ..."
+    if not surnames:
+        raise BuildError(f"reference {entry.key!r}: cannot read the author list")
+    if et_al or len(surnames) >= 3:
+        names = f"{surnames[0]} et al."
+    elif len(surnames) == 2:
+        names = f"{surnames[0]} & {surnames[1]}"
+    else:
+        names = surnames[0]
+    return f"{names}, {m.group('year')}"
+
+
+def render_citations(ctx: BuildContext, text: str, errors: list[str]) -> str:
+    """Replace every [CITE:k1,k2] by "(A, 2026; B et al., 2025)"."""
+    def repl(m: re.Match[str]) -> str:
+        keys = cite_keys(m.group("keys"))
+        try:
+            refs = ctx.references()
+        except BuildError as exc:
+            errors.append(f"{m.group(0)}: {exc}")
+            return m.group(0)
+        missing = [k for k in keys if k not in refs]
+        if missing or not keys:
+            errors.append(f"{m.group(0)}: no entry in {ctx.references_path()} for "
+                          f"{', '.join(missing) or '(empty citation)'}")
+            return m.group(0)
+        if ctx.final and not all(refs[k].confirmed for k in keys):
+            return m.group(0)  # left as the marker; build(final=True) reports it as unfinished
+        try:
+            return "(" + "; ".join(author_year(refs[k]) for k in keys) + ")"
+        except BuildError as exc:
+            errors.append(f"{m.group(0)}: {exc}")
+            return m.group(0)
+    return CITE_RE.sub(repl, text)
+
+
+def h_refs(ctx: BuildContext, ph: str, keys: Sequence[str]) -> str:
+    if not keys:
+        raise BuildError("refs: the draft cites no keys")
+    refs = ctx.references()
+    missing = [k for k in keys if k not in refs]
+    if missing:
+        raise BuildError(f"no entry in {ctx.references_path()} for {', '.join(missing)}")
+    entries = sorted((refs[k] for k in keys), key=lambda e: (e.text.lower(), e.key))
+    for e in entries:  # numbers inside entries (pages, arXiv ids) are traced to references.md
+        ctx.used.append(UsedNumber(ph, "ref", e.text, ctx.rel(ctx.references_path()), str(e.line), e.key))
+    return "\n".join(f"- {e.text}" for e in entries)
+
+
+# ---------------------------------------------------------------------------------------------
 # Formatting and filtering
 # ---------------------------------------------------------------------------------------------
 
@@ -314,9 +441,18 @@ def need_column(table: Table, col: str) -> None:
 # ---------------------------------------------------------------------------------------------
 
 
+def split_spec(spec: str) -> tuple[str, str | None]:
+    """``.3f?–`` -> (``.3f``, ``–``): the text after '?' replaces a missing value."""
+    fmt, sep, missing = spec.partition("?")
+    return fmt, (missing if sep else None)
+
+
 def _cell(ctx: BuildContext, ph: str, kind: str, table: Table, row: int, col: str, spec: str) -> str:
     need_column(table, col)
-    out = format_value(table.rows[row][col], spec)
+    fmt, missing_text = split_spec(spec)
+    out = format_value(table.rows[row][col], fmt)
+    if out is None and missing_text is not None:
+        return missing_text
     if out is None:
         ctx.warnings.append(f"{ph}: value missing in {table.name}.csv row {row} column {col}; rendered {MISSING!r}")
         out = MISSING
@@ -439,6 +575,10 @@ def h_pivot(ctx: BuildContext, ph: str, args: list[str]) -> str:
                 cells.append("missing")
                 ctx.warnings.append(f"{ph}: no row for {row_col}={r}, {col_col}={c}")
                 continue
+            fmt, missing_text = split_spec(spec)
+            if with_ci and missing_text is not None and format_value(t.rows[i][value_col], fmt) is None:
+                cells.append(missing_text)
+                continue
             text = _cell(ctx, ph, "pivot", t, i, value_col, spec)
             if with_ci:
                 text += " " + _ci(ctx, ph, t, i, spec)
@@ -534,12 +674,15 @@ def fill(ctx: BuildContext, draft: str) -> tuple[str, list[str]]:
     text = COMMENT_RE.sub("", draft)
     text = COMMENT_RE.sub("", _expand_includes(ctx, text, errors))
     text = _collect_defaults(ctx, text, errors)
+    keys = cited_keys(text)
 
     def repl(m: re.Match[str]) -> str:
         ph = m.group(0)
         body = m.group("body").strip()
         kind = body.split(":", 1)[0]
         try:
+            if body == "refs":
+                return h_refs(ctx, ph, keys)
             if kind == "fig":
                 return h_fig(ctx, ph, body)
             if kind not in HANDLERS:
@@ -550,6 +693,7 @@ def fill(ctx: BuildContext, draft: str) -> tuple[str, list[str]]:
             return ph
 
     text = PLACEHOLDER_RE.sub(repl, text)
+    text = render_citations(ctx, text, errors)
     for line_no, line in enumerate(text.split("\n"), start=1):
         if ("{{" in line or "}}" in line) and not any(e.split(": ", 1)[0] in line for e in errors):
             errors.append(f"line {line_no}: unresolved or malformed placeholder: {line.strip()[:120]}")
@@ -700,6 +844,7 @@ def markdown_to_docx(md: str, out: Path, base_dir: Path) -> None:
 
 def build(ctx: BuildContext, draft_path: Path, *, final: bool = False, docx: bool = True) -> list[str]:
     """Fill the draft and write outputs. Returns errors (outputs written only if there are none)."""
+    ctx.final = final
     text, errors = fill(ctx, draft_path.read_text(encoding="utf-8"))
     if final:
         for line_no, line in enumerate(text.split("\n"), start=1):
@@ -728,7 +873,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     ap.add_argument("--tables", type=Path, default=None, help="default: paths.tables in config.yaml")
     ap.add_argument("--figures", type=Path, default=None, help="default: paths.figures in config.yaml")
     ap.add_argument("--out-dir", type=Path, default=REPO_ROOT / "paper")
-    ap.add_argument("--final", action="store_true", help="fail on remaining [CITE:...]/[RESULT PROSE] markers")
+    ap.add_argument("--refs", type=Path, default=None, help="default: references.md next to the draft")
+    ap.add_argument("--final", action="store_true",
+                    help="fail on citations not CONFIRMED in references.md and on remaining editorial markers")
     ap.add_argument("--no-docx", action="store_true")
     ap.add_argument("--allow-dry-run", action="store_true", help="accept rows whose data_source is dry-run")
     args = ap.parse_args(argv)
@@ -737,7 +884,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         tables_dir=args.tables or _resolve(args.config, cfg["paths"]["tables"]),
         figures_dir=args.figures or _resolve(args.config, cfg["paths"]["figures"]),
         config_path=args.config, draft_dir=args.draft.resolve().parent, out_dir=args.out_dir,
-        allow_dry_run=args.allow_dry_run,
+        allow_dry_run=args.allow_dry_run, refs_path=args.refs,
     )
     errors = build(ctx, args.draft, final=args.final, docx=not args.no_docx)
     for w in ctx.warnings:
