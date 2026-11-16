@@ -134,7 +134,8 @@ def synthetic_tables(root: Path) -> tuple[Path, Path]:
               [[subject, cond, k, metric, *est(), 60, 60, "applied (0 items)"]
                for subject in (*SUBJECTS, "ALL_MODELS") for cond in CONDITIONS
                for k in ((0,) if subject == "mistral-7b" else (0, 1, 2))
-               for metric in ("bluff_shift", "net_bluff_shift")])
+               for metric in ("bluff_shift", "net_bluff_shift", "excess_hysteresis_abs",
+                              "ablation_T3a_minus_T3")])
     write_csv(tables / "per_tier.csv",
               ["subject", "condition", "metric", "tier", "estimate", "ci_low", "ci_high", "n_items", "n_cells",
                "samples", "exclusions"],

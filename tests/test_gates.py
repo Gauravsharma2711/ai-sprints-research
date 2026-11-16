@@ -321,3 +321,10 @@ def test_run_gate_catches_exceptions(monkeypatch: pytest.MonkeyPatch, tmp_path: 
 
 def test_skip_tests_gate_does_not_run_pytest(tmp_path: Path) -> None:
     assert g.g1_tests(g.Ctx(root=tmp_path, python="python", skip_tests=True))[0] == "SKIP"
+
+
+def test_validation_check_markers_are_human_owned() -> None:
+    assert g.human_owned_marker("[CHECK: enable when human_judge_agreement.csv exists]", {})
+    assert g.human_owned_marker("[CHECK: enable when annotation_agreement.csv exists]", {})
+    assert not g.human_owned_marker("[CHECK: enable when other_table.csv exists]", {})
+    assert not g.human_owned_marker("[CHECK: anything else]", {})

@@ -712,6 +712,10 @@ def g4_validation_tables(ctx: Ctx) -> GateResult:
 def human_owned_marker(marker: str, entries: dict[str, bool]) -> bool:
     if marker in ("[AUTHOR NAMES]", "[AFFILIATIONS]"):
         return True
+    # Slots for the human-validation tables (G4): they wait on human ratings/labels, not on code.
+    v = re.fullmatch(r"\[CHECK: enable when (\S+\.csv) exists\]", marker)
+    if v and v.group(1) in {name for name, _ in VALIDATION_TABLES}:
+        return True
     m = CITE_RE.fullmatch(marker)
     if m:
         keys = [k.strip() for k in m.group(1).split(",") if k.strip()]
