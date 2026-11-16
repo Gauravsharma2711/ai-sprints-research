@@ -34,12 +34,12 @@ We ask default-prompted open-weights models 60 yes/no decision questions, record
 
 - **H2, bluff vs neutral follow-up** (net bluff shift, default prompt): +0.184 [+0.157, +0.211], **supported**.
 - **H4, hysteresis after retraction** (excess `|c3 - c1|` over the neutral control, default prompt): +0.080 [+0.056, +0.108], **supported**.
-- **H5, concession-only context ablation** (bluff kept in context, only the model's own Turn-2 reply swapped; change in `|c3 - c1|`, default prompt; negative = closer to the initial answer): neutral placeholder -0.025 [-0.045, -0.009] (**supported**); stand-firm reply -0.046 [-0.067, -0.026] (**supported**). Such effects are *consistent with self-conditioning*; a context ablation does not establish a mechanism.
+- **H5, concession-only context ablation** (bluff kept in context, only the model's own Turn-2 reply swapped; change in `|c3 - c1|`, default prompt; negative = closer to the initial answer): neutral placeholder -0.025 [-0.045, -0.009] (**supported**); stand-firm reply -0.046 [-0.067, -0.026] (**supported**). Such effects are *consistent with self-conditioning*; a context ablation does not establish a mechanism. The neutral-placeholder (T3a) effect is small and wording-specific: its CI includes 0 on the other two paraphrases of the scripted turns (paper, Appendix C).
 - **H3, stand-firm prompt minus default**: bluff shift -0.097 [-0.133, -0.059] (**supported**); evidence update -0.015 [-0.060, +0.033] (**inconclusive**).
 - **Selectivity** (mean evidence update minus mean bluff shift): under the default prompt +0.063 [-0.012, +0.141], **inconclusive (CI includes 0)**; **H6**, contract prompt minus default: +0.059 [-0.004, +0.120] (**inconclusive**).
 - **H6, contract prompt minus default, excess hysteresis**: -0.120 [-0.153, -0.088] (**supported**).
 
-The primary analysis uses one scripted wording per turn: sample *i* uses paraphrase *i* of each fixed user turn, so sample 0 always uses the first paraphrase; a paraphrase-robustness check is in the paper's appendix. All H1 to H6 results are in the [Results](#results) table. The paper, *Do Default-Prompted Open-Weights LLMs Recover Their Beliefs After a Retracted Challenge? Measuring Epistemic Hysteresis in Multi-Turn Advice*, is in [`paper/`](paper/) (the submitted PDF will be added there as `paper/paper.pdf`).
+The primary analysis uses one scripted wording per turn: sample *i* uses paraphrase *i* of each fixed user turn, so sample 0 always uses the first paraphrase; a paraphrase-robustness check is in the paper's appendix. All H1 to H6 results are in the [Results](#results) table. The paper, *Retracted but Not Forgotten: Belief Recovery after Evidence-Free Pushback in Open-Weights LLM Advisors*, is in [`paper/`](paper/) (the submitted PDF will be added there as `paper/paper.pdf`).
 <!-- END GENERATED: tldr -->
 
 <!-- BEGIN GENERATED: figure-summary -->
@@ -382,7 +382,7 @@ Claude (Claude Code, Anthropic) drafted the 60 benchmark items, including their 
 <!-- BEGIN GENERATED: citation -->
 ```bibtex
 @misc{sharma2026epistemichysteresis,
-  title        = {Do Default-Prompted Open-Weights LLMs Recover Their Beliefs After a Retracted Challenge? Measuring Epistemic Hysteresis in Multi-Turn Advice},
+  title        = {Retracted but Not Forgotten: Belief Recovery after Evidence-Free Pushback in Open-Weights LLM Advisors},
   author       = {Gaurav Sharma},
   year         = {2026},
   howpublished = {Apart Research AI x Epistemics Research Sprint},

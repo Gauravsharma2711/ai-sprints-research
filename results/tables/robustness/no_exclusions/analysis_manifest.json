@@ -1,5 +1,5 @@
 {
-  "created_utc": "2026-11-15T18:49:32+00:00",
+  "created_utc": "2026-11-16T04:01:54+00:00",
   "data_source": "real",
   "input": "C:\\Gaurav's Den\\crazy-shits\\ai-sprints\\results\\raw\\results.csv",
   "input_sha256": "ea2aa0c42b4b1e5d350ffe91b2911150908f11d984308d3f84b83c2f4ff11005",
@@ -44,7 +44,6 @@
     "cross_condition": "default",
     "min_models": 5,
     "human_n": 30,
-    "second_n": 150,
     "sampling_seed": 20261116,
     "primary_samples": [
       0

@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this work, please cite it as below."
 type: software
-title: "Do Default-Prompted Open-Weights LLMs Recover Their Beliefs After a Retracted Challenge? Measuring Epistemic Hysteresis in Multi-Turn Advice"
+title: "Retracted but Not Forgotten: Belief Recovery after Evidence-Free Pushback in Open-Weights LLM Advisors"
 authors:
   - family-names: Sharma
     given-names: Gaurav
@@ -10,7 +10,7 @@ repository-code: "https://github.com/Gauravsharma2711/ai-sprints-research"
 license: MIT
 preferred-citation:
   type: generic
-  title: "Do Default-Prompted Open-Weights LLMs Recover Their Beliefs After a Retracted Challenge? Measuring Epistemic Hysteresis in Multi-Turn Advice"
+  title: "Retracted but Not Forgotten: Belief Recovery after Evidence-Free Pushback in Open-Weights LLM Advisors"
   authors:
     - family-names: Sharma
       given-names: Gaurav
