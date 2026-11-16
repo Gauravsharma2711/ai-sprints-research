@@ -379,9 +379,9 @@ def test_refs_placeholder_lists_cited_entries_sorted(tmp_path: Path) -> None:
     assert errors == []
     text = (out / "paper.md").read_text(encoding="utf-8")
     refs = text.split("## References", 1)[1].strip().splitlines()
-    assert refs == ["- Ab, C., & Cd, E. (2025). Two Authors, pp. 11-22. CONFIRMED by user 2026-11-16.",
-                    "- Smith, J. (2024). A Single-Author Paper. arXiv:2401.00001. UNCONFIRMED - user must check.",
-                    "- Zed, A., Young, B., & Xu, C. (2023). Three Authors. CONFIRMED."]
+    assert refs == ["- Ab, C., & Cd, E. (2025). Two Authors, pp. 11-22.",
+                    "- Smith, J. (2024). A Single-Author Paper. arXiv:2401.00001.",
+                    "- Zed, A., Young, B., & Xu, C. (2023). Three Authors."]
     assert "Never" not in text  # uncited entries are not listed
     # numbers inside entries are traced to references.md, so the audit passes
     code = na.main([str(out / "paper.md"), "--numbers-used", str(out / "numbers_used.csv"), "--config", str(CONFIG)])
@@ -425,7 +425,7 @@ def test_docx_created_and_opens(tmp_path: Path) -> None:
     assert "Figure 1. A caption: with colon." in texts
     assert any("line one" in t and "line two" in t for t in texts)
     assert len(doc.tables) == 1
-    assert doc.tables[0].cell(0, 0).text == "condition"
+    assert doc.tables[0].cell(0, 0).text == "Condition"
     assert doc.tables[0].cell(1, 2).text == "0.123"
     assert len(doc.inline_shapes) == 1
 
@@ -579,3 +579,35 @@ def test_export_prompts_verbatim() -> None:
 
 def test_committed_appendix_is_up_to_date() -> None:
     assert ep.main(["--check"]) == 0
+
+
+def test_publication_text_drops_working_notes() -> None:
+    entry = ("Hong, J. (2025). Measuring Sycophancy. Findings of EMNLP 2025, pp. 2239-2259 (per arXiv journal-ref). "
+             "arXiv:2505.23840. https://arxiv.org/abs/2505.23840. Author list needs checking. "
+             "UNCONFIRMED - user must check.")
+    out = bp.publication_text(entry)
+    assert out.endswith("https://arxiv.org/abs/2505.23840.")
+    assert "UNCONFIRMED" not in out and "per arXiv" not in out and "needs checking" not in out
+    assert bp.publication_text("Doe, A. (2020). No link. CONFIRMED.") == "Doe, A. (2020). No link."
+
+
+def test_typeset_numbers_minus_and_unbreakable_ci() -> None:
+    out = bp.typeset_numbers("fell (-0.067 [-0.095, -0.040]) in qwen2.5-7b, stand-firm, tiers 1-3")
+    assert "−0.067 [−0.095, −0.040]" in out
+    assert "qwen2.5-7b" in out and "stand-firm" in out and "1-3" in out
+
+
+def test_docx_layout_tables_and_references(tmp_path: Path) -> None:
+    from docx import Document
+
+    md = ("# Title\n\nJane Doe\n\n**Abstract.** Short.\n\n## Results\n\n**Table 1. Demo.**\n\n"
+          "| metric | estimate | ci |\n|---|---|---|\n| net_bluff_shift | 0.184 | [0.157, 0.211] |\n\n"
+          "## References\n\n- Doe, A. (2020). A paper. https://example.org.\n")
+    out = tmp_path / "p.docx"
+    bp.markdown_to_docx(md, out, tmp_path)
+    doc = Document(str(out))
+    assert doc.styles["Normal"].font.name == bp.BODY_FONT
+    header = [c.text for c in doc.tables[0].rows[0].cells]
+    assert header == ["Metric", "Estimate", "95% CI"]
+    ref = [p for p in doc.paragraphs if p.text.startswith("Doe, A.")][0]
+    assert ref.style.name == "Normal" and ref.paragraph_format.first_line_indent is not None

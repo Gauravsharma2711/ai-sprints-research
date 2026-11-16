@@ -65,7 +65,8 @@ MASKS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^\s*\d{1,2}[.)](?=\s)", re.MULTILINE),                  # numbered-list markers
     re.compile(r"^#{1,6}\s*[A-Z]?[\d.]*", re.MULTILINE),                 # heading numbers
 )
-TOKEN_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_.\-/]*[A-Za-z0-9_])?")
+# U+2011 (non-breaking hyphen) appears inside identifiers in the Word/PDF tables.
+TOKEN_RE = re.compile(r"[A-Za-z0-9_](?:[A-Za-z0-9_.\-/\u2011]*[A-Za-z0-9_])?")
 NUMBER_RE = re.compile(r"(?<![\w.])(?:[-+−](?=\d))?\d+(?:,\d{3})*(?:\.\d+)?%?")
 
 

@@ -142,7 +142,7 @@ def test_length_counts_main_text_tables_and_figures() -> None:
     # "Results prose."(2) "Discussion prose."(2) = 11; extra prose line = 4. References onward excluded.
     assert words == 6 + 11 + 4
     status, detail = g.check_length(draft)
-    assert status == "PASS" and "4 tables+figures" in detail
+    assert "4 tables+figures" in detail and status == ("PASS" if 4 <= g.MAX_MAIN_TABLES_FIGS else "FAIL")
 
 
 def test_length_fails_over_limits() -> None:

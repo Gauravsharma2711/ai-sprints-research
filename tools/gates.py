@@ -48,8 +48,10 @@ GateResult = tuple[Status, str]
 EXPECTED_PROTOCOL_HASH = "677f941a762b"
 ABSTRACT_MIN_WORDS = 150
 ABSTRACT_MAX_WORDS = 250
-MAX_MAIN_WORDS = 3800
-MAX_MAIN_TABLES_FIGS = 5
+# Calibrated on the built paper.docx measured in Word (2026-11-16): 3757 words with 5 tables/figures
+# ran to ~12.5 pages; 2368 words with 2 tables/figures ended at ~7.6 pages (limit: 8 before References).
+MAX_MAIN_WORDS = 2600
+MAX_MAIN_TABLES_FIGS = 3
 SUBPROCESS_TIMEOUT_S = 600
 
 PLACEHOLDER_RE = re.compile(r"\{\{[^{}\n]*\}\}")

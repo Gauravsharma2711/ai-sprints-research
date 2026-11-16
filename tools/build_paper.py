@@ -346,7 +346,19 @@ def h_refs(ctx: BuildContext, ph: str, keys: Sequence[str]) -> str:
     entries = sorted((refs[k] for k in keys), key=lambda e: (e.text.lower(), e.key))
     for e in entries:  # numbers inside entries (pages, arXiv ids) are traced to references.md
         ctx.used.append(UsedNumber(ph, "ref", e.text, ctx.rel(ctx.references_path()), str(e.line), e.key))
-    return "\n".join(f"- {e.text}" for e in entries)
+    return "\n".join(f"- {publication_text(e.text)}" for e in entries)
+
+
+_STATUS_RE = re.compile(r"\s*\b(?:UN)?CONFIRMED\b[^.]*\.?\s*$")
+_PROVENANCE_RE = re.compile(r"\s*\(per arXiv [^)]*\)")
+
+
+def publication_text(entry_text: str) -> str:
+    """Reference as printed in the paper: everything up to and including its URL, without the working
+    notes kept in references.md (confirmation status, provenance remarks, author-list caveats)."""
+    m = re.search(r"https?://\S+?(?=\.?(?:\s|$))", entry_text)
+    text = entry_text[:m.end()] + "." if m else _STATUS_RE.sub("", entry_text)
+    return _PROVENANCE_RE.sub("", text).strip()
 
 
 # ---------------------------------------------------------------------------------------------
@@ -718,19 +730,30 @@ _TABLE_SEP_RE = re.compile(r"^\|?\s*:?-{3,}:?\s*(\|\s*:?-{3,}:?\s*)*\|?\s*$")
 _IMAGE_RE = re.compile(r"^!\[(?P<alt>[^\]]*)\]\((?P<src>[^)]+)\)\s*$")
 
 
+_NEG_NUMBER_RE = re.compile(r"(?<![\w.\-])-(?=\d)")
+_CI_SPACE_RE = re.compile(r"(\[[−+]?\d[\d.]*%?),\s+(?=[−+]?\d)")
+
+
+def typeset_numbers(text: str) -> str:
+    """Word output only: a true minus sign for negative numbers (no line break after it) and a
+    non-breaking space inside "[lo, hi]" so a CI never splits across lines."""
+    text = _NEG_NUMBER_RE.sub("−", text)
+    return _CI_SPACE_RE.sub("\\1,\u00a0", text)
+
+
 def _add_inline(paragraph: Any, text: str) -> None:
     for part in _INLINE_RE.split(text):
         if not part:
             continue
         if part.startswith("**") and part.endswith("**") and len(part) > 4:
-            paragraph.add_run(part[2:-2]).bold = True
+            paragraph.add_run(typeset_numbers(part[2:-2])).bold = True
         elif part.startswith("`") and part.endswith("`") and len(part) > 2:
             run = paragraph.add_run(part[1:-1])
-            run.font.name = "Courier New"
+            _set_font(run.font, MONO_FONT, None)
         elif part.startswith("*") and part.endswith("*") and len(part) > 2:
-            paragraph.add_run(part[1:-1]).italic = True
+            paragraph.add_run(typeset_numbers(part[1:-1])).italic = True
         else:
-            paragraph.add_run(part.replace("\\|", "|"))
+            paragraph.add_run(typeset_numbers(part.replace("\\|", "|")))
 
 
 def _split_row(line: str) -> list[str]:
@@ -742,19 +765,239 @@ def _split_row(line: str) -> list[str]:
     return [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", s)]
 
 
+# Word layout: an academic single-column style (serif body, black headings, booktabs tables).
+BODY_FONT = "Times New Roman"
+MONO_FONT = "Consolas"
+BODY_PT = 11.0
+TABLE_PT = 8.0
+CAPTION_PT = 9.5
+TEXT_WIDTH_IN = 6.5
+MAX_FIG_HEIGHT_IN = 8.4
+# Column headers shown in Word tables (paper.md keeps the raw table column names).
+HEADER_LABELS: dict[str, str] = {
+    "hypothesis": "Hyp.", "subject": "Model", "comparison": "Comparison", "metric": "Metric",
+    "predicted_sign": "Pred.", "estimate": "Estimate", "ci": "95% CI", "n_items": "Items",
+    "n_cells": "Cells", "n_judged": "Judged", "verdict": "Verdict", "holm_p": "Holm p",
+    "holm_verdict": "Holm verdict", "paraphrase_idx": "Paraphrase", "condition": "Condition",
+    "sample": "Sample", "tier": "Tier", "arm": "Arm", "contrast": "Contrast",
+    "n_qualifying_cells": "Qualifying cells", "restriction": "Restriction",
+}
+_CAPTION_RE = re.compile(r"^\*{0,2}(Table|Tables|Figure)\s+[A-Z]?\d")
+_PAGE_BREAK_BEFORE = re.compile(r"^(Limitations and Dual-Use|Appendix [ABC]\b)")
+
+
+def _set_font(style_or_run_font: Any, name: str, size: float | None = None) -> None:
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+
+    style_or_run_font.name = name
+    if size is not None:
+        style_or_run_font.size = Pt(size)
+    rpr = style_or_run_font.element.rPr if hasattr(style_or_run_font, "element") else None
+    if rpr is not None:
+        fonts = rpr.find(qn("w:rFonts"))
+        if fonts is not None:
+            for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+                fonts.set(qn(attr), name)
+
+
+def _style_document(doc: Any) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt, RGBColor
+
+    for section in doc.sections:
+        section.page_width, section.page_height = Inches(8.5), Inches(11)
+        section.left_margin = section.right_margin = Inches(1)
+        section.top_margin = section.bottom_margin = Inches(1)
+        # centred page number in the footer
+        p = section.footer.paragraphs[0]
+        p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        p.add_run("Page ").font.size = Pt(9)
+        run = p.add_run()
+        for tag, text in (("begin", None), (None, "PAGE"), ("end", None)):
+            if tag:
+                el = OxmlElement("w:fldChar")
+                el.set(qn("w:fldCharType"), tag)
+            else:
+                el = OxmlElement("w:instrText")
+                el.set(qn("xml:space"), "preserve")
+                el.text = text
+            run._r.append(el)
+        run.font.size = Pt(9)
+
+    styles = doc.styles
+    normal = styles["Normal"]
+    _set_font(normal.font, BODY_FONT, BODY_PT)
+    normal.element.get_or_add_rPr()
+    rfonts = normal.element.rPr.find(qn("w:rFonts"))
+    if rfonts is None:
+        rfonts = OxmlElement("w:rFonts")
+        normal.element.rPr.append(rfonts)
+    for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+        rfonts.set(qn(attr), BODY_FONT)
+    pf = normal.paragraph_format
+    pf.space_before, pf.space_after = Pt(0), Pt(5)
+    pf.line_spacing = 1.0
+    pf.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+    for name, size, before, after, italic in (("Title", 17, 0, 6, False), ("Heading 1", 13, 14, 5, False),
+                                              ("Heading 2", 11.5, 10, 3, False), ("Heading 3", 11, 8, 2, True)):
+        st = styles[name]
+        _set_font(st.font, BODY_FONT, size)
+        st.font.bold = True
+        st.font.italic = italic
+        st.font.color.rgb = RGBColor(0, 0, 0)
+        st.paragraph_format.space_before, st.paragraph_format.space_after = Pt(before), Pt(after)
+        st.paragraph_format.keep_with_next = True
+        st.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.CENTER if name == "Title" else WD_ALIGN_PARAGRAPH.LEFT
+        ppr = st.element.get_or_add_pPr()
+        for border in ppr.findall(qn("w:pBdr")):  # the default Title style has a rule under it
+            ppr.remove(border)
+        rpr = st.element.get_or_add_rPr()
+        for el in rpr.findall(qn("w:rFonts")):
+            for attr in ("w:ascii", "w:hAnsi", "w:cs", "w:eastAsia"):
+                el.set(qn(attr), BODY_FONT)
+            for attr in ("w:asciiTheme", "w:hAnsiTheme", "w:cstheme", "w:eastAsiaTheme"):
+                if el.get(qn(attr)) is not None:
+                    del el.attrib[qn(attr)]
+    for name in ("List Bullet", "List Number"):
+        styles[name].paragraph_format.space_after = Pt(2)
+        styles[name].paragraph_format.alignment = WD_ALIGN_PARAGRAPH.JUSTIFY
+
+
+def _breakable(text: str) -> str:
+    """Let long identifiers (ablation_T3a_minus_T3) wrap at underscores instead of mid-number."""
+    return text.replace("_", "_\u200b")
+
+
+def _format_table(table: Any, header: Sequence[str], body: Sequence[Sequence[str]]) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Inches, Pt
+
+    tbl = table._tbl
+    tblpr = tbl.tblPr
+    width = OxmlElement("w:tblW")
+    width.set(qn("w:w"), "5000")
+    width.set(qn("w:type"), "pct")
+    for old in tblpr.findall(qn("w:tblW")):
+        tblpr.remove(old)
+    tblpr.append(width)
+    borders = OxmlElement("w:tblBorders")
+    for edge, val in (("top", "single"), ("bottom", "single"), ("left", "nil"), ("right", "nil"),
+                      ("insideH", "nil"), ("insideV", "nil")):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:val"), val)
+        if val == "single":
+            el.set(qn("w:sz"), "8")
+            el.set(qn("w:color"), "000000")
+        borders.append(el)
+    tblpr.append(borders)
+    margins = OxmlElement("w:tblCellMar")
+    for edge, w in (("top", "15"), ("bottom", "15"), ("left", "60"), ("right", "60")):
+        el = OxmlElement(f"w:{edge}")
+        el.set(qn("w:w"), w)
+        el.set(qn("w:type"), "dxa")
+        margins.append(el)
+    tblpr.append(margins)
+    # Column widths proportional to content (capped), so wide text columns get the room.
+    ncols = len(header)
+    lengths = []
+    for c in range(ncols):
+        texts = [HEADER_LABELS.get(header[c], header[c])] + [row[c] if c < len(row) else "" for row in body]
+        lengths.append(min(max(max(len(t) for t in texts), 4), 55))
+    total = sum(lengths)
+    table.autofit = False
+    for c in range(ncols):
+        w = Inches(TEXT_WIDTH_IN * lengths[c] / total)
+        table.columns[c].width = w
+        for cell in table.columns[c].cells:
+            cell.width = w
+
+    for r, cells in enumerate([header, *body]):
+        row = table.rows[r]
+        if r == 0:
+            trpr = row._tr.get_or_add_trPr()
+            repeat = OxmlElement("w:tblHeader")
+            repeat.set(qn("w:val"), "true")
+            trpr.append(repeat)
+            cant_split = OxmlElement("w:cantSplit")
+            trpr.append(cant_split)
+        for c in range(len(header)):
+            cell = row.cells[c]
+            text = cells[c] if c < len(cells) else ""
+            if r == 0:
+                text = HEADER_LABELS.get(text, text.replace("_", " "))
+            par = cell.paragraphs[0]
+            # non-breaking hyphen inside identifiers (Qwen2.5-7B-Instruct) so they never wrap at "-"
+            _add_inline(par, _breakable(re.sub(r"(?<=\w)-(?=\w)", "\u2011", text)))
+            par.paragraph_format.space_after = Pt(0)
+            par.paragraph_format.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            for run in par.runs:
+                run.font.size = Pt(TABLE_PT)
+                if r == 0:
+                    run.bold = True
+            tcpr = cell._tc.get_or_add_tcPr()
+            if r == 0:
+                shade = OxmlElement("w:shd")
+                shade.set(qn("w:val"), "clear")
+                shade.set(qn("w:color"), "auto")
+                shade.set(qn("w:fill"), "EDEDED")
+                tcpr.append(shade)
+                tcb = OxmlElement("w:tcBorders")
+                bottom = OxmlElement("w:bottom")
+                bottom.set(qn("w:val"), "single")
+                bottom.set(qn("w:sz"), "6")
+                bottom.set(qn("w:color"), "000000")
+                tcb.append(bottom)
+                tcpr.append(tcb)
+
+
 def markdown_to_docx(md: str, out: Path, base_dir: Path) -> None:
     from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+    from docx.image.image import Image as DocxImage
     from docx.shared import Inches, Pt
 
     doc = Document()
+    _style_document(doc)
     lines = md.split("\n")
     i = 0
     para: list[str] = []
+    state: dict[str, Any] = {"front": False, "seen_h2": False, "section": ""}
 
     def flush() -> None:
-        if para:
-            _add_inline(doc.add_paragraph(), " ".join(s.strip() for s in para))
-            para.clear()
+        if not para:
+            return
+        text = " ".join(s.strip() for s in para)
+        para.clear()
+        p = doc.add_paragraph()
+        if state["front"] and not state["seen_h2"]:
+            if text.startswith("**Abstract"):
+                p.paragraph_format.left_indent = p.paragraph_format.right_indent = Inches(0.4)
+                p.paragraph_format.space_before = Pt(8)
+                p.paragraph_format.space_after = Pt(8)
+                _add_inline(p, text)
+                for run in p.runs:
+                    run.font.size = Pt(10)
+                return
+            p.alignment = WD_ALIGN_PARAGRAPH.CENTER  # author and affiliation lines
+            p.paragraph_format.space_after = Pt(1)
+            _add_inline(p, text)
+            return
+        if _CAPTION_RE.match(text):
+            p.paragraph_format.keep_with_next = text.lstrip("*").startswith("Table")
+            p.paragraph_format.space_before = Pt(6)
+            p.paragraph_format.space_after = Pt(3)
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            _add_inline(p, text)
+            for run in p.runs:
+                run.font.size = Pt(CAPTION_PT)
+            return
+        _add_inline(p, text)
 
     while i < len(lines):
         line = lines[i]
@@ -769,10 +1012,11 @@ def markdown_to_docx(md: str, out: Path, base_dir: Path) -> None:
                 block.append(lines[i])
                 i += 1
             p = doc.add_paragraph()
+            p.alignment = WD_ALIGN_PARAGRAPH.LEFT
+            p.paragraph_format.left_indent = Inches(0.2)
             for n, code_line in enumerate(block):
                 run = p.add_run(code_line)
-                run.font.name = "Courier New"
-                run.font.size = Pt(9)
+                _set_font(run.font, MONO_FONT, 8)
                 if n < len(block) - 1:
                     run.add_break()
             i += 1
@@ -784,7 +1028,17 @@ def markdown_to_docx(md: str, out: Path, base_dir: Path) -> None:
         heading = re.match(r"^(#{1,6})\s+(.*)$", stripped)
         if heading:
             flush()
-            doc.add_heading(heading.group(2).strip(), level=min(len(heading.group(1)) - 1, 9))
+            level = min(len(heading.group(1)) - 1, 9)
+            title = heading.group(2).strip()
+            if level == 0:
+                state["front"] = True
+            else:
+                state["seen_h2"] = True
+            if level == 1:
+                state["section"] = title
+            if level == 1 and _PAGE_BREAK_BEFORE.match(title):
+                doc.add_paragraph().add_run().add_break(WD_BREAK.PAGE)
+            doc.add_heading(title, level=level)
             i += 1
             continue
         if stripped.startswith("|") and i + 1 < len(lines) and _TABLE_SEP_RE.match(lines[i + 1].strip()):
@@ -796,21 +1050,22 @@ def markdown_to_docx(md: str, out: Path, base_dir: Path) -> None:
                 body.append(_split_row(lines[i]))
                 i += 1
             table = doc.add_table(rows=1 + len(body), cols=len(header))
-            table.style = "Table Grid"
-            for r, cells in enumerate([header, *body]):
-                for c in range(len(header)):
-                    cell_par = table.cell(r, c).paragraphs[0]
-                    _add_inline(cell_par, cells[c] if c < len(cells) else "")
-                    if r == 0:
-                        for run in cell_par.runs:
-                            run.bold = True
+            _format_table(table, header, body)
+            spacer = doc.add_paragraph()
+            spacer.paragraph_format.space_after = Pt(2)
             continue
         image = _IMAGE_RE.match(stripped)
         if image:
             flush()
             src = Path(image.group("src"))
             path = src if src.is_absolute() else base_dir / src
-            doc.add_picture(str(path), width=Inches(6.0))
+            img = DocxImage.from_file(str(path))
+            width_in = min(TEXT_WIDTH_IN, MAX_FIG_HEIGHT_IN * img.px_width / img.px_height)
+            doc.add_picture(str(path), width=Inches(width_in))
+            pic_par = doc.paragraphs[-1]
+            pic_par.alignment = WD_ALIGN_PARAGRAPH.CENTER
+            pic_par.paragraph_format.keep_with_next = True
+            pic_par.paragraph_format.space_before = Pt(6)
             i += 1
             continue
         bullet = re.match(r"^\s*[-*]\s+(.*)$", line)
@@ -819,7 +1074,17 @@ def markdown_to_docx(md: str, out: Path, base_dir: Path) -> None:
             flush()
             m = bullet or number
             assert m is not None
-            _add_inline(doc.add_paragraph(style="List Bullet" if bullet else "List Number"), m.group(1))
+            if bullet and str(state["section"]).startswith("References"):
+                ref = doc.add_paragraph()  # hanging indent, no bullet
+                ref.alignment = WD_ALIGN_PARAGRAPH.LEFT
+                ref.paragraph_format.left_indent = Inches(0.25)
+                ref.paragraph_format.first_line_indent = Inches(-0.25)
+                ref.paragraph_format.space_after = Pt(3)
+                _add_inline(ref, m.group(1))
+                for run in ref.runs:
+                    run.font.size = Pt(9.5)
+            else:
+                _add_inline(doc.add_paragraph(style="List Bullet" if bullet else "List Number"), m.group(1))
             i += 1
             continue
         if stripped.startswith(">"):

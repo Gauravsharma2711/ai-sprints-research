@@ -1094,7 +1094,8 @@ def _plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
     models = sorted(set(hyp["subject"]) - {POOLED})
     shape = {m: MODEL_MARKERS[k % len(MODEL_MARKERS)] for k, m in enumerate(models)}
     step = 0.6 / max(1, len(models))
-    fig, ax = plt.subplots(figsize=(12.0, max(5.0, 1.4 + 0.75 * max(1, len(rows)))))
+    # drawn near the printed width (6.5 in) so the 10-pt text stays legible in the paper
+    fig, ax = plt.subplots(figsize=(7.4, max(3.6, 0.9 + 0.44 * max(1, len(rows)))))
     labels: list[str] = []
     finite: list[float] = []
     has_holm = "holm_verdict" in hyp.columns
@@ -1115,11 +1116,11 @@ def _plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
             if pooled:
                 filled = has_holm and str(r.iloc[0]["holm_verdict"]) == "supported"
                 ax.errorbar([est], [y], xerr=_err([est], [lo], [hi]), color=colour, marker=POOLED_MARKER,
-                            markersize=9, markerfacecolor=colour if filled else "white", markeredgewidth=1.6,
-                            elinewidth=1.8, capsize=3, linestyle="none", zorder=3)
+                            markersize=7, markerfacecolor=colour if filled else "white", markeredgewidth=1.4,
+                            elinewidth=1.6, capsize=2.5, linestyle="none", zorder=3)
             else:
                 ax.errorbar([est], [y], xerr=_err([est], [lo], [hi]), color=colour, marker=shape[subject],
-                            markersize=6, markerfacecolor=colour, markeredgewidth=0.8, elinewidth=0.9,
+                            markersize=4.5, markerfacecolor=colour, markeredgewidth=0.8, elinewidth=0.9,
                             capsize=0, linestyle="none", zorder=2)
             finite += [v for v in (est, lo, hi) if not math.isnan(v)]
     ax.axvline(0, color=OKABE_ITO["black"], lw=0.8, zorder=1)
@@ -1134,18 +1135,18 @@ def _plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
     grey = OKABE_ITO["black"]
     handles = [Line2D([], [], color=c, marker="o", ls="none", markersize=8, label=f"CI verdict: {v}")
                for v, (c, _) in VERDICT_STYLE.items() if v in present]
-    handles += [Line2D([], [], color=grey, marker=POOLED_MARKER, ls="none", markersize=9,
-                       label=f"pooled, Holm-adjusted p < {HOLM_ALPHA}\n(supported)"),
-                Line2D([], [], color=grey, marker=POOLED_MARKER, ls="none", markersize=9, markerfacecolor="white",
-                       markeredgewidth=1.6, label="pooled, not supported\nafter Holm correction")]
-    handles += [Line2D([], [], color=grey, marker=shape[m], ls="none", markersize=6, label=m) for m in models]
-    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False,
-              labelspacing=0.9)
+    handles += [Line2D([], [], color=grey, marker=POOLED_MARKER, ls="none", markersize=7,
+                       label=f"pooled, Holm p < {HOLM_ALPHA} (filled)"),
+                Line2D([], [], color=grey, marker=POOLED_MARKER, ls="none", markersize=7, markerfacecolor="white",
+                       markeredgewidth=1.4, label="pooled, not supported after Holm (hollow)")]
+    handles += [Line2D([], [], color=grey, marker=shape[m], ls="none", markersize=5, label=m) for m in models]
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.4, -0.1), frameon=False, ncol=3,
+              columnspacing=1.2, handletextpad=0.3)
     samples = plain_samples(str(hyp["samples"].iloc[0])) if len(hyp) else ""
     title = "Hypotheses H1-H6: pooled and per-model estimates" + (f", {samples}" if samples else "")
     if banner:
         title = f"{banner}\n{title}"
-    ax.set_title(title, fontsize=13, color=OKABE_ITO["vermillion"] if banner else OKABE_ITO["black"])
+    ax.set_title(title, fontsize=11, color=OKABE_ITO["vermillion"] if banner else OKABE_ITO["black"])
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300, bbox_inches="tight")
