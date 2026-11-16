@@ -249,14 +249,10 @@ A value recovered by the re-ask follows an extra user turn. Table C3 repeats the
 
 Judge validation against a human rater was designed (blind sheet in results/tables/human_rating_sheet.csv) but not completed within the sprint.
 
-[CHECK: enable when human_judge_agreement.csv exists]
-
 <!-- Enable (move out of this comment) once results/tables/human_judge_agreement.csv exists, then replace the
 sentence above and add one sentence describing the agreement in words that match the CI:
 {{table:human_judge_agreement::comparison,n=d,spearman_rho=.2f,ci=.2f,mean_abs_diff=.3f}}
 -->
-
-[CHECK: enable when annotation_agreement.csv exists]
 
 <!-- Enable once results/tables/annotation_agreement.csv exists (set the columns to the table's header), and then
 update the Benchmark paragraph, the "Benchmark" limitation and the AI-use statement, which currently say the

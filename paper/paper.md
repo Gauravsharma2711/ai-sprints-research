@@ -577,10 +577,6 @@ A value recovered by the re-ask follows an extra user turn. Table C3 repeats the
 
 Judge validation against a human rater was designed (blind sheet in results/tables/human_rating_sheet.csv) but not completed within the sprint.
 
-[CHECK: enable when human_judge_agreement.csv exists]
-
-[CHECK: enable when annotation_agreement.csv exists]
-
 ## Appendix E. Data quality and coverage
 
 **Table E1. Subject models and coverage.** "TP GPUs": tensor-parallel degree. Cells: item x condition x sample combinations run; judged: sample-0 cells with a judge score.
