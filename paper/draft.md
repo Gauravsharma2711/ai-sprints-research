@@ -173,7 +173,7 @@ The research plan, `docs/playbook_preexisting.md`, was written before the sprint
 
 Claude (Claude Code, Anthropic) drafted the {{data:n_items:d}} benchmark items, including their tiers, evidence directions and truth labels; searched and summarised related work; wrote all code; and drafted this paper and its README. Google Gemini ({{cfg:judge.model:s}}) served as the LLM judge. The author, Gaurav Sharma, directed the project, made the design decisions, ran all model runs on Kaggle, and is responsible for all content. The benchmark labels have not been independently verified by a human.
 
-At the time of writing, the author has not yet reviewed the benchmark items or confirmed the references below.
+The author checked and confirmed every cited reference. The benchmark items have not been reviewed by a human.
 
 ## Appendix A. Prompts
 

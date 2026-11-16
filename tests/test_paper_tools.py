@@ -554,7 +554,8 @@ def test_real_draft_builds_on_synthetic_tables_and_passes_audit(tmp_path: Path) 
     assert code == 0
     assert "## References" in text and "(Shnaidman, 2026)" in text and "[CITE:" not in text
     assert "| brier_T1 | " in text and "| \u2013 |" in text  # tier-2 Brier rendered as a dash
-    assert bp.build(make_ctx(tables, figures, out, DRAFT.parent), DRAFT, final=True)  # markers remain
+    # citations are confirmed and no editorial markers remain, so the final build succeeds too
+    assert bp.build(make_ctx(tables, figures, out, DRAFT.parent), DRAFT, final=True) == []
 
 
 # ---------------------------------------------------------------------------------------------
