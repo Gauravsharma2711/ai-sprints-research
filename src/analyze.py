@@ -7,6 +7,9 @@ Commands (add --dry-run to read the mock-client output in results/dry_run/ inste
     python -m src.analyze robustness                  # metrics + hypotheses under tables/robustness/
                                                       #   all_samples/ and no_exclusions/
     python -m src.analyze per-tier                    # key metrics by tier (also written by `metrics`)
+    python -m src.analyze per-paraphrase              # key metrics per scripted-turn paraphrase (every
+                                                      #   sample; sample i used paraphrase i)
+    python -m src.analyze first-attempt               # H2-H6 on cells whose arms parsed first time
     python -m src.analyze all                         # all of the above, then each validation command
                                                       #   whose input exists (else "skipped: waiting for")
     python -m src.analyze annotation-agreement        # review_sheet a_* labels vs drafted labels
@@ -89,9 +92,9 @@ VERDICT_STYLE: dict[str, tuple[str, str]] = {  # verdict -> (Okabe-Ito colour, m
     "supported": (OKABE_ITO["bluish_green"], "o"), "opposite": (OKABE_ITO["vermillion"], "s"),
     "inconclusive": (OKABE_ITO["blue"], "D"), "no data": (OKABE_ITO["black"], "x")}
 REF_LINE = "#000000A0"  # reference lines: Okabe-Ito black, partly transparent
-FIG_MIN_FONT = 9  # pt; every figure text is at least this size
-FIG_RC: dict[str, Any] = {"font.size": 10, "axes.titlesize": 10, "axes.labelsize": 10,
-                          "xtick.labelsize": 9, "ytick.labelsize": 9, "legend.fontsize": 9,
+FIG_MIN_FONT = 10  # pt at the saved size; every figure text is at least this size
+FIG_RC: dict[str, Any] = {"font.size": 11, "axes.titlesize": 11, "axes.labelsize": 11,
+                          "xtick.labelsize": 10, "ytick.labelsize": 10, "legend.fontsize": 10,
                           "figure.dpi": 100, "savefig.dpi": 300}
 EXTRA_COLOURS: tuple[str, ...] = ("#E69F00", "#56B4E9", "#CC79A7", "#000000")
 MODEL_COLOURS: tuple[str, ...] = ("#0072B2", "#D55E00", "#009E73", "#E69F00", "#56B4E9", "#CC79A7", "#000000")
@@ -465,23 +468,55 @@ def _combine(kind: Kind, am: np.ndarray | float, bm: np.ndarray | float | None) 
         return np.where(np.asarray(bm) != 0, np.asarray(am) / np.asarray(bm), np.nan)
 
 
-def bootstrap(kind: Kind, a: np.ndarray, b: np.ndarray | None, *, n_boot: int, seed: int,
-              ci: float) -> tuple[float, float, float]:
-    """Point estimate and percentile CI, resampling items with replacement. A fresh generator
-    per call keeps every interval reproducible regardless of call order."""
+def bootstrap_p(dist: np.ndarray, n_boot: int) -> float:
+    """Two-sided bootstrap p-value against 0: 2 * min(share of resampled statistics <= 0, share
+    >= 0), over non-NaN resamples, floored at 1/n_boot and capped at 1. NaN if no usable resample."""
+    finite = dist[~np.isnan(dist)]
+    if finite.size == 0:
+        return math.nan
+    p = 2.0 * min(float(np.mean(finite <= 0)), float(np.mean(finite >= 0)))
+    return float(min(1.0, max(p, 1.0 / n_boot)))
+
+
+def bootstrap_with_p(kind: Kind, a: np.ndarray, b: np.ndarray | None, *, n_boot: int, seed: int,
+                     ci: float) -> tuple[float, float, float, float]:
+    """Point estimate, percentile CI and two-sided bootstrap p (bootstrap_p), resampling items with
+    replacement. A fresh generator per call keeps every interval reproducible regardless of call
+    order; the CI is identical to `bootstrap` with the same arguments."""
     n = len(a)
     if n == 0:
-        return math.nan, math.nan, math.nan
+        return math.nan, math.nan, math.nan, math.nan
     point = float(_combine(kind, a.mean(), None if b is None else b.mean()))
     if n < 2:
-        return point, math.nan, math.nan
+        return point, math.nan, math.nan, math.nan
     rng = np.random.default_rng(seed)
     idx = rng.integers(0, n, size=(n_boot, n))
-    dist = _combine(kind, a[idx].mean(axis=1), None if b is None else b[idx].mean(axis=1))
+    dist = np.asarray(_combine(kind, a[idx].mean(axis=1), None if b is None else b[idx].mean(axis=1)),
+                      dtype=float)
     if np.all(np.isnan(dist)):
-        return point, math.nan, math.nan
+        return point, math.nan, math.nan, math.nan
     lo, hi = np.nanpercentile(dist, [(1 - ci) / 2 * 100, (1 + ci) / 2 * 100])
-    return point, float(lo), float(hi)
+    return point, float(lo), float(hi), bootstrap_p(dist, n_boot)
+
+
+def bootstrap(kind: Kind, a: np.ndarray, b: np.ndarray | None, *, n_boot: int, seed: int,
+              ci: float) -> tuple[float, float, float]:
+    """Point estimate and percentile CI, resampling items with replacement."""
+    est, lo, hi, _ = bootstrap_with_p(kind, a, b, n_boot=n_boot, seed=seed, ci=ci)
+    return est, lo, hi
+
+
+def holm_adjust(p: Sequence[float]) -> list[float]:
+    """Holm step-down adjusted p-values. NaN entries stay NaN and are not counted in the family."""
+    vals = [float(v) for v in p]
+    present = [(v, k) for k, v in enumerate(vals) if not math.isnan(v)]
+    out = [math.nan] * len(vals)
+    m = len(present)
+    running = 0.0
+    for rank, (v, k) in enumerate(sorted(present)):
+        running = max(running, min(1.0, (m - rank) * v))
+        out[k] = running
+    return out
 
 
 def _tier_slice(d: pd.DataFrame, tier: str) -> pd.DataFrame:
@@ -680,7 +715,28 @@ HYPOTHESES: tuple[Hypothesis, ...] = (
 HYPOTHESIS_COLUMNS: tuple[str, ...] = (
     "hypothesis", "description", "subject", "comparison", "metric", "tier", "predicted_sign", "estimate",
     "ci_low", "ci_high", "n_items", "n_cells", "verdict", "samples", "exclusions",
+    "p_boot", "holm_p", "holm_verdict",
 )
+FIRST_ATTEMPT_COLUMNS: tuple[str, ...] = (*HYPOTHESIS_COLUMNS, "restriction")
+FIRST_ATTEMPT_LABEL = "first-attempt parses only"
+HOLM_ALPHA = 0.05  # holm_verdict threshold on holm_p
+HOLM_FAMILY = (f"every pooled {POOLED} row of the file (one per hypothesis x metric x comparison) with a "
+               "finite p_boot; per-model rows are not in the family (holm_p and holm_verdict empty)")
+
+# Subject arms whose values enter each metric (status_<arm> columns). The first-attempt
+# restriction keeps a cell only if every one of these arms has status "ok" (parsed on the first
+# attempt, not "reask_ok"); for a contrast the rule applies to the cells of both conditions.
+METRIC_ARMS: dict[str, tuple[str, ...]] = {
+    "bluff_shift": ("T1", "T2A"),
+    "net_bluff_shift": ("T1", "T2A", "T2N"),
+    "evidence_update": ("T1", "T2B"),
+    "selectivity": ("T1", "T2A", "T2B"),
+    "excess_hysteresis_abs": ("T1", "T3", "T3N"),
+    "ablation_T3a_minus_T3": ("T1", "T3", "T3a"),
+    "ablation_T3b_minus_T3": ("T1", "T3", "T3b"),
+    "ablation_T3c_minus_T3": ("T1", "T3", "T3c"),
+}
+FIRST_ATTEMPT_HYPOTHESES: tuple[str, ...] = ("H2", "H3", "H4", "H5", "H6")  # H1 (judge-based) not recomputed
 
 
 def verdict(est: float, lo: float, hi: float, predicted: Sign) -> str:
@@ -700,26 +756,78 @@ def verdict(est: float, lo: float, hi: float, predicted: Sign) -> str:
     return "inconclusive"
 
 
-def compute_hypotheses(d: pd.DataFrame, s: Settings, scope: Scope) -> pd.DataFrame:
+def sign_verdict(est: float, p: float, predicted: Sign, alpha: float) -> str:
+    """Verdict from an (adjusted) p-value and the sign of the estimate: below alpha, 'supported' if
+    the estimate has the predicted sign (for !=0, either sign), 'opposite' if not; otherwise
+    'inconclusive'. NaN estimate: 'no data'."""
+    if est is None or math.isnan(est):
+        return "no data"
+    if p is None or math.isnan(p) or not p < alpha:
+        return "inconclusive"
+    if predicted == "!=0" or (predicted == ">0" and est > 0) or (predicted == "<0" and est < 0):
+        return "supported"
+    return "opposite" if est != 0 else "inconclusive"
+
+
+def add_holm(table: pd.DataFrame, alpha: float) -> pd.DataFrame:
+    """Fill holm_p and holm_verdict for the pooled ALL_MODELS family (HOLM_FAMILY); per-model rows
+    get empty values."""
+    out = table.copy()
+    out["holm_p"] = math.nan
+    out["holm_verdict"] = ""
+    pooled = out.index[out["subject"] == POOLED]
+    adjusted = holm_adjust(out.loc[pooled, "p_boot"].astype(float).tolist())
+    for k, adj in zip(pooled, adjusted):
+        out.at[k, "holm_p"] = adj
+        out.at[k, "holm_verdict"] = sign_verdict(float(out.at[k, "estimate"]), adj,
+                                                 out.at[k, "predicted_sign"], alpha)
+    return out
+
+
+def first_attempt_cells(d: pd.DataFrame, arms: Sequence[str]) -> pd.DataFrame:
+    """Cells where every listed arm parsed on the first attempt (status exactly 'ok')."""
+    mask = pd.Series(True, index=d.index)
+    for arm in arms:
+        mask &= d[f"status_{arm}"].astype(str).eq("ok")
+    return d[mask]
+
+
+def compute_hypotheses(d: pd.DataFrame, s: Settings, scope: Scope, *,
+                       first_attempt: bool = False) -> pd.DataFrame:
     """d: row metrics (add_row_metrics) of the analysed rows. One row per hypothesis x model,
-    plus pooled ALL_MODELS."""
+    plus pooled ALL_MODELS, with a two-sided bootstrap p and Holm adjustment over the pooled rows.
+    first_attempt: only the hypotheses in FIRST_ATTEMPT_HYPOTHESES, each on the cells where every
+    arm in METRIC_ARMS[metric] has status 'ok'; adds the `restriction` column."""
     rows: list[dict[str, Any]] = []
     for h in HYPOTHESES:
+        if first_attempt and h.hid not in FIRST_ATTEMPT_HYPOTHESES:
+            continue
         m = METRIC_BY_NAME[h.metric]
-        for subject, ds in _subject_slices(d):
+        dh = first_attempt_cells(d, METRIC_ARMS[h.metric]) if first_attempt else d
+        # every model of the analysed rows keeps a row, even if the restriction leaves it no cells
+        slices = [(sj, dh[dh["subject"] == sj]) for sj in sorted(d["subject"].unique())] + [(POOLED, dh)]
+        for subject, ds in slices:
             if h.baseline is None:
-                est, lo, hi, n_items, n_cells = metric_estimate(
-                    _tier_slice(ds[ds["condition"] == h.condition], h.tier), m, s)
+                a, b, n_cells = item_arrays(_tier_slice(ds[ds["condition"] == h.condition], h.tier), m)
+                kind: Kind = m.kind
             else:
-                est, lo, hi, n_items, n_cells = contrast_estimate(ds, h.condition, h.baseline, h.tier, m, s)
+                base_d = _tier_slice(ds[ds["condition"] == h.baseline], h.tier)
+                other_d = _tier_slice(ds[ds["condition"] == h.condition], h.tier)
+                a, n_cells = paired_contrast(base_d, other_d, m)
+                b, kind = None, "mean"
+            est, lo, hi, p = bootstrap_with_p(kind, a, b, n_boot=s.n_boot, seed=s.seed, ci=s.ci)
             rows.append({
                 "hypothesis": h.hid, "description": h.description, "subject": subject,
                 "comparison": h.comparison, "metric": h.metric, "tier": h.tier, "predicted_sign": h.predicted,
-                "estimate": est, "ci_low": lo, "ci_high": hi, "n_items": n_items, "n_cells": n_cells,
+                "estimate": est, "ci_low": lo, "ci_high": hi, "n_items": len(a), "n_cells": n_cells,
                 "verdict": verdict(est, lo, hi, h.predicted), "samples": scope.samples,
-                "exclusions": scope.exclusions,
+                "exclusions": scope.exclusions, "p_boot": p,
             })
-    return pd.DataFrame(rows, columns=list(HYPOTHESIS_COLUMNS))
+    table = add_holm(pd.DataFrame(rows, columns=list(HYPOTHESIS_COLUMNS)), HOLM_ALPHA)
+    if first_attempt:
+        table["restriction"] = FIRST_ATTEMPT_LABEL
+        return table[list(FIRST_ATTEMPT_COLUMNS)]
+    return table
 
 
 def cross_model(metrics: pd.DataFrame, s: Settings) -> tuple[pd.DataFrame, int]:
@@ -768,8 +876,42 @@ def _colour(cond: str, i: int) -> str:
     return CONDITION_COLOURS.get(cond, EXTRA_COLOURS[i % len(EXTRA_COLOURS)])
 
 
+NUMBER_WORDS: tuple[str, ...] = ("zero", "one", "two", "three", "four", "five", "six", "seven", "eight",
+                                  "nine", "ten")
+CONDITION_LABELS: dict[str, str] = {"default": "default prompt", "stand_firm": "stand-firm prompt",
+                                    "contract_prompt": "contract prompt"}
+
+
+def _number(n: int) -> str:
+    return NUMBER_WORDS[n] if 0 <= n < len(NUMBER_WORDS) else str(n)
+
+
+def plain_samples(samples: str) -> str:
+    """Scope sample label ("0", "0,1", "all") in words for figure titles."""
+    if samples == "all":
+        return "all samples"
+    parts = [v for v in samples.split(",") if v]
+    return f"sample {parts[0]}" if len(parts) == 1 else f"samples {', '.join(parts)}"
+
+
+def _cond_label(cond: str) -> str:
+    return CONDITION_LABELS.get(cond, cond)
+
+
+def summary_title(scope: str, point_subjects: Sequence[str], note: str, banner: str) -> str:
+    """Plain-language figure title, e.g. "Pooled over three models, all evidence tiers, sample 0"."""
+    n = len(point_subjects)
+    who = f"Pooled over {_number(n)} model{'s' if n != 1 else ''}" if scope == POOLED else scope
+    title = f"{who}, all evidence tiers"
+    if note:
+        title += f", {note}"
+    return f"{banner}\n{title}" if banner else title
+
+
 def plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], conditions: list[str],
                  path: Path, banner: str, ci: float, note: str = "") -> None:
+    """Three stacked panels (legible at single-column width). `note` is a plain-language scope
+    note such as "sample 0" (plain_samples)."""
     with plt.rc_context(FIG_RC):
         _plot_summary(metrics, scope, point_subjects, conditions, path, banner, ci, note)
 
@@ -778,7 +920,7 @@ def _plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], 
                   path: Path, banner: str, ci: float, note: str) -> None:
     look = _lookup(metrics)
     nan3 = (math.nan, math.nan, math.nan)
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5.2))
+    fig, axes = plt.subplots(3, 1, figsize=(6.4, 14.5))
     pct = f"{ci:.0%} CI"
 
     # (A) trajectory |P - c1| at T1 -> T2 -> T3, bluff path vs neutral control
@@ -793,14 +935,16 @@ def _plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], 
             col = _colour(cond, i)
             ax.errorbar(xs + off, est, yerr=_err(est, lo, hi), color=col, linestyle=style, marker="o",
                         markerfacecolor=col if filled else "white", capsize=3, linewidth=1.6)
-    ax.set_xticks(xs, ["T1\n(reference)", "T2\nbluff / neutral", "T3\nrelease / neutral"])
+    ax.set_xticks(xs, ["T1 (reference)", "T2: bluff or neutral", "T3: release or neutral"])
     ax.set_ylabel("mean |P(yes) - c1|")
-    ax.set_title(f"(A) Movement from T1 ({pct})")
-    handles = [Line2D([], [], color=_colour(c, i), lw=2, label=c) for i, c in enumerate(conditions)]
-    handles += [Line2D([], [], color=OKABE_ITO["black"], ls="-", marker="o", label="bluff -> release"),
+    ax.set_title(f"(A) Movement away from the T1 answer ({pct})", loc="left")
+    handles = [Line2D([], [], color=_colour(c, i), lw=2, label=_cond_label(c)) for i, c in enumerate(conditions)]
+    handles += [Line2D([], [], color=OKABE_ITO["black"], ls="-", marker="o", label="bluff, then release"),
                 Line2D([], [], color=OKABE_ITO["black"], ls="--", marker="o", markerfacecolor="white",
                        label="neutral control (T2N, T3N)")]
-    ax.legend(handles=handles, loc="upper left")
+    y_lo, y_hi = ax.get_ylim()
+    ax.set_ylim(y_lo, y_hi + 0.5 * (y_hi - y_lo))  # headroom so the legend does not cover data
+    ax.legend(handles=handles, loc="upper left", frameon=False)
 
     # (B) bluff shift vs evidence update
     ax = axes[1]
@@ -825,39 +969,35 @@ def _plot_summary(metrics: pd.DataFrame, scope: str, point_subjects: list[str], 
                 va="bottom", ha="right")
     ax.axhline(0, color=REF_LINE, lw=0.8)
     ax.set_xlabel("bluff shift |c2A - c1|")
-    ax.set_ylabel("evidence update (c2B - c1) x direction")
-    ax.set_title(f"(B) Bluff shift vs evidence update ({pct})")
-    handles = [Line2D([], [], color=_colour(c, i), marker="o", ls="none", label=c)
+    ax.set_ylabel("evidence update\n(c2B - c1) x direction")
+    ax.set_title(f"(B) Bluff shift vs evidence update ({pct})", loc="left")
+    handles = [Line2D([], [], color=_colour(c, i), marker="o", ls="none", label=_cond_label(c))
                for i, c in enumerate(conditions)]
     if len(point_subjects) > 1:
         handles += [Line2D([], [], color=OKABE_ITO["black"], marker=MARKERS[j % len(MARKERS)], ls="none",
                            label=s) for j, s in enumerate(point_subjects)]
-    ax.legend(handles=handles, loc="best")
+    ax.legend(handles=handles, loc="best", frameon=False)
 
-    # (C) T3 ablations vs plain T3
+    # (C) T3 context ablations vs plain T3
     ax = axes[2]
-    ablations = (("ablation_T3a_minus_T3", "T3a\nneutral\nplaceholder"),
-                 ("ablation_T3b_minus_T3", "T3b\nstand-firm\nreply"),
-                 ("ablation_T3c_minus_T3", "T3c\nbluff\nremoved"))
+    ablations = (("ablation_T3a_minus_T3", "T3a: neutral\nplaceholder"),
+                 ("ablation_T3b_minus_T3", "T3b: stand-firm\nreply"),
+                 ("ablation_T3c_minus_T3", "T3c: bluff\nremoved"))
     width = 0.8 / max(1, len(conditions))
     for i, cond in enumerate(conditions):
         vals = [look.get((scope, cond, "all", name), nan3) for name, _ in ablations]
         est, lo, hi = zip(*vals)
         pos = np.arange(len(ablations)) + (i - (len(conditions) - 1) / 2) * width
-        ax.bar(pos, np.nan_to_num(est), width=width, color=_colour(cond, i), label=cond,
+        ax.bar(pos, np.nan_to_num(est), width=width, color=_colour(cond, i), label=_cond_label(cond),
                yerr=_err(est, lo, hi), capsize=3, edgecolor=OKABE_ITO["black"], linewidth=0.5)
     ax.axhline(0, color=OKABE_ITO["black"], lw=0.8)
     ax.set_xticks(np.arange(len(ablations)), [label for _, label in ablations])
-    ax.set_ylabel("|c3x - c1| - |c3 - c1| (paired)")
-    ax.set_title(f"(C) T3 ablations vs plain T3 ({pct})")
-    ax.legend()
+    ax.set_ylabel("|c3x - c1| - |c3 - c1|\n(paired)")
+    ax.set_title(f"(C) Context ablations vs plain T3 ({pct})", loc="left")
+    ax.legend(frameon=False)
 
-    title = f"Summary: {scope} (all tiers)"
-    if note:
-        title += f", {note}"
-    if banner:
-        title += f"  |  {banner}"
-    fig.suptitle(title, fontsize=12, color=OKABE_ITO["vermillion"] if banner else OKABE_ITO["black"])
+    fig.suptitle(summary_title(scope, point_subjects, note, banner), fontsize=13,
+                 color=OKABE_ITO["vermillion"] if banner else OKABE_ITO["black"])
     fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300, bbox_inches="tight")
@@ -903,6 +1043,33 @@ def plot_cross_model(metrics: pd.DataFrame, cross: pd.DataFrame, s: Settings, pa
     plt.close(fig)
 
 
+METRIC_PLAIN: dict[str, str] = {
+    "extremity_gap": "Extremity gap, tier 3",
+    "net_bluff_shift": "Net bluff shift",
+    "bluff_shift": "Bluff shift",
+    "evidence_update": "Evidence update",
+    "excess_hysteresis_abs": "Excess hysteresis",
+    "ablation_T3a_minus_T3": "Neutral-placeholder ablation T3a",
+    "ablation_T3b_minus_T3": "Stand-firm-reply ablation T3b",
+    "ablation_T3c_minus_T3": "Bluff-removed ablation T3c",
+    "selectivity": "Selectivity",
+}
+COMPARISON_PLAIN: dict[str, str] = {"stand_firm - default": "stand-firm vs default prompt",
+                                    "contract_prompt - default": "contract vs default prompt"}
+POOLED_MARKER = "o"
+MODEL_MARKERS: tuple[str, ...] = ("s", "^", "v", "P", "X", "D", "*")
+
+
+def forest_label(hid: str, metric_name: str, comparison: str) -> str:
+    """Plain row label, e.g. "Net bluff shift (H2)" or "Bluff shift: stand-firm vs default prompt (H3)"."""
+    label = METRIC_PLAIN.get(metric_name, metric_name)
+    if comparison in COMPARISON_PLAIN:
+        label += f":\n{COMPARISON_PLAIN[comparison]}"
+    elif " - " in comparison:
+        label += f":\n{comparison}"
+    return f"{label} ({hid})"
+
+
 def _forest_rows(hyp: pd.DataFrame) -> list[tuple[str, str, str]]:
     """Unique (hypothesis, metric, comparison) rows, in table order."""
     seen: list[tuple[str, str, str]] = []
@@ -914,9 +1081,10 @@ def _forest_rows(hyp: pd.DataFrame) -> list[tuple[str, str, str]]:
 
 
 def plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
-    """Forest plot of hypotheses.csv: one row per hypothesis x metric (x comparison). Pooled
-    ALL_MODELS is a filled marker; each model is a small open marker just below it, in a fixed
-    order named in the title. Item-bootstrap CI; colour and marker by verdict; vertical line at 0."""
+    """Forest plot of hypotheses.csv: one row per hypothesis x metric (x comparison). The pooled
+    estimate is a large circle, filled if its Holm-adjusted verdict is 'supported', hollow
+    otherwise; each model is a smaller marker of its own shape just below it. Colour = CI verdict.
+    Item-bootstrap CI; vertical line at 0."""
     with plt.rc_context(FIG_RC):
         _plot_forest(hyp, path, banner, ci)
 
@@ -924,27 +1092,35 @@ def plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
 def _plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
     rows = _forest_rows(hyp)
     models = sorted(set(hyp["subject"]) - {POOLED})
+    shape = {m: MODEL_MARKERS[k % len(MODEL_MARKERS)] for k, m in enumerate(models)}
     step = 0.6 / max(1, len(models))
-    fig, ax = plt.subplots(figsize=(3.5, 1.6 + 0.62 * max(1, len(rows))))
+    fig, ax = plt.subplots(figsize=(12.0, max(5.0, 1.4 + 0.75 * max(1, len(rows)))))
     labels: list[str] = []
     finite: list[float] = []
+    has_holm = "holm_verdict" in hyp.columns
     for y_idx, (hid, metric_name, comparison) in enumerate(rows):
         y0 = -float(y_idx)
-        labels.append(f"{hid}: {metric_name}\n{comparison}")
+        labels.append(forest_label(hid, metric_name, comparison))
         sub = hyp[(hyp["hypothesis"] == hid) & (hyp["metric"] == metric_name) & (hyp["comparison"] == comparison)]
-        points = [(POOLED, y0, True)] + [(m, y0 - step * (k + 1), False) for k, m in enumerate(models)]
-        for subject, y, filled in points:
+        points = [(POOLED, y0)] + [(m, y0 - step * (k + 1)) for k, m in enumerate(models)]
+        for subject, y in points:
             r = sub[sub["subject"] == subject]
             if r.empty:
                 continue
             est, lo, hi = (float(r.iloc[0][c]) for c in ("estimate", "ci_low", "ci_high"))
             if math.isnan(est):
                 continue
-            colour, marker = VERDICT_STYLE.get(str(r.iloc[0]["verdict"]), VERDICT_STYLE["no data"])
-            ax.errorbar([est], [y], xerr=_err([est], [lo], [hi]), color=colour, marker=marker,
-                        markersize=6 if filled else 3.5, markerfacecolor=colour if filled else "white",
-                        markeredgewidth=1.0, elinewidth=1.4 if filled else 0.7, capsize=2 if filled else 0,
-                        linestyle="none", zorder=3 if filled else 2)
+            colour, _ = VERDICT_STYLE.get(str(r.iloc[0]["verdict"]), VERDICT_STYLE["no data"])
+            pooled = subject == POOLED
+            if pooled:
+                filled = has_holm and str(r.iloc[0]["holm_verdict"]) == "supported"
+                ax.errorbar([est], [y], xerr=_err([est], [lo], [hi]), color=colour, marker=POOLED_MARKER,
+                            markersize=9, markerfacecolor=colour if filled else "white", markeredgewidth=1.6,
+                            elinewidth=1.8, capsize=3, linestyle="none", zorder=3)
+            else:
+                ax.errorbar([est], [y], xerr=_err([est], [lo], [hi]), color=colour, marker=shape[subject],
+                            markersize=6, markerfacecolor=colour, markeredgewidth=0.8, elinewidth=0.9,
+                            capsize=0, linestyle="none", zorder=2)
             finite += [v for v in (est, lo, hi) if not math.isnan(v)]
     ax.axvline(0, color=OKABE_ITO["black"], lw=0.8, zorder=1)
     ax.set_yticks([-float(k) for k in range(len(rows))], labels)
@@ -955,22 +1131,22 @@ def _plot_forest(hyp: pd.DataFrame, path: Path, banner: str, ci: float) -> None:
     ax.set_xlabel(f"estimate ({ci:.0%} CI, bootstrap over items)")
     ax.grid(axis="x", color=REF_LINE, lw=0.4, alpha=0.4)
     present = set(hyp["verdict"].astype(str))
-    handles = [Line2D([], [], color=c, marker=m, ls="none", label=v) for v, (c, m) in VERDICT_STYLE.items()
-               if v in present]
-    handles += [Line2D([], [], color=OKABE_ITO["black"], marker="o", ls="none", markersize=6, label=POOLED),
-                Line2D([], [], color=OKABE_ITO["black"], marker="o", ls="none", markersize=3.5,
-                       markerfacecolor="white", label="per model")]
-    fig.legend(handles=handles, loc="lower center", ncol=2, frameon=False, bbox_to_anchor=(0.5, 0.0))
-    title = "Hypotheses H1-H6"
-    if len(hyp):
-        title += f"\nsamples={hyp['samples'].iloc[0]}; exclusions {hyp['exclusions'].iloc[0]}"
-    if models:
-        title += "\nopen markers, top to bottom:\n" + ", ".join(models)
+    grey = OKABE_ITO["black"]
+    handles = [Line2D([], [], color=c, marker="o", ls="none", markersize=8, label=f"CI verdict: {v}")
+               for v, (c, _) in VERDICT_STYLE.items() if v in present]
+    handles += [Line2D([], [], color=grey, marker=POOLED_MARKER, ls="none", markersize=9,
+                       label=f"pooled, Holm-adjusted p < {HOLM_ALPHA}\n(supported)"),
+                Line2D([], [], color=grey, marker=POOLED_MARKER, ls="none", markersize=9, markerfacecolor="white",
+                       markeredgewidth=1.6, label="pooled, not supported\nafter Holm correction")]
+    handles += [Line2D([], [], color=grey, marker=shape[m], ls="none", markersize=6, label=m) for m in models]
+    ax.legend(handles=handles, loc="center left", bbox_to_anchor=(1.01, 0.5), frameon=False,
+              labelspacing=0.9)
+    samples = plain_samples(str(hyp["samples"].iloc[0])) if len(hyp) else ""
+    title = "Hypotheses H1-H6: pooled and per-model estimates" + (f", {samples}" if samples else "")
     if banner:
         title = f"{banner}\n{title}"
-    ax.set_title(title, fontsize=FIG_MIN_FONT, color=OKABE_ITO["vermillion"] if banner else OKABE_ITO["black"])
-    n_leg_rows = math.ceil(len(handles) / 2)
-    fig.tight_layout(rect=(0.0, 0.035 * n_leg_rows * 5 / max(5.0, 1.6 + 0.62 * len(rows)), 1.0, 1.0))
+    ax.set_title(title, fontsize=13, color=OKABE_ITO["vermillion"] if banner else OKABE_ITO["black"])
+    fig.tight_layout()
     path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=300, bbox_inches="tight")
     plt.close(fig)
@@ -1424,6 +1600,112 @@ def write_per_tier(table: pd.DataFrame, df: pd.DataFrame, s: Settings, paths: Pa
     return [out, md]
 
 
+PER_PARAPHRASE_METRICS: tuple[str, ...] = (
+    "bluff_shift", "neutral_shift_T2N", "net_bluff_shift", "evidence_update", "excess_hysteresis_abs",
+    "ablation_T3a_minus_T3", "ablation_T3b_minus_T3", "ablation_T3c_minus_T3",
+)
+PER_PARAPHRASE_COLUMNS: tuple[str, ...] = ("subject", "condition", "paraphrase_idx", "metric", "estimate",
+                                           "ci_low", "ci_high", "n_items", "n_cells", "exclusions")
+
+
+def paraphrase_subjects(d: pd.DataFrame) -> tuple[list[str], dict[int, list[str]]]:
+    """(models with more than one scripted-turn paraphrase present, paraphrase -> models with rows
+    in it). The pooled ALL_MODELS row of paraphrase k uses every model with rows in k."""
+    per_model = d.groupby("subject")["paraphrase_idx"].nunique()
+    multi = sorted(per_model[per_model > 1].index)
+    by_para = {int(k): sorted(g["subject"].unique()) for k, g in d.groupby("paraphrase_idx")}
+    return multi, by_para
+
+
+def compute_per_paraphrase(d: pd.DataFrame, s: Settings, scope: Scope) -> pd.DataFrame:
+    """d: row metrics of every sample (exclusions applied). Sample i used scripted-turn paraphrase
+    paraphrase_idx; each paraphrase is analysed separately with the item bootstrap."""
+    multi, by_para = paraphrase_subjects(d)
+    rows: list[dict[str, Any]] = []
+    subjects = [*multi, POOLED]
+    for subject in subjects:
+        ds = d if subject == POOLED else d[d["subject"] == subject]
+        for cond in conditions_in(d):
+            dc = ds[ds["condition"] == cond]
+            for k in sorted(by_para):
+                if subject != POOLED and subject not in by_para[k]:
+                    continue
+                dk = dc[dc["paraphrase_idx"] == k]
+                for name in PER_PARAPHRASE_METRICS:
+                    est, lo, hi, n_items, n_cells = metric_estimate(dk, METRIC_BY_NAME[name], s)
+                    rows.append({"subject": subject, "condition": cond, "paraphrase_idx": k, "metric": name,
+                                 "estimate": est, "ci_low": lo, "ci_high": hi, "n_items": n_items,
+                                 "n_cells": n_cells, "exclusions": scope.exclusions})
+    return pd.DataFrame(rows, columns=list(PER_PARAPHRASE_COLUMNS))
+
+
+def run_per_paraphrase(df_loaded: pd.DataFrame, s: Settings, paths: Paths) -> list[Path]:
+    """results/tables/per_paraphrase.csv (+ .md, + manifest): every sample, exclusions applied."""
+    _, df, scope = apply_scope(df_loaded, s, all_samples=True, use_exclusions=True)
+    if df.empty:
+        raise ConfigError("no rows left after exclusions")
+    if "paraphrase_idx" not in df.columns or df["paraphrase_idx"].isna().any():
+        raise ConfigError("results.csv lacks paraphrase_idx values; cannot split by paraphrase")
+    df = df.assign(paraphrase_idx=df["paraphrase_idx"].astype(int))
+    table = compute_per_paraphrase(add_row_metrics(df, s), s, scope)
+    multi, by_para = paraphrase_subjects(df)
+    paths.tables.mkdir(parents=True, exist_ok=True)
+    out = paths.tables / "per_paraphrase.csv"
+    table.to_csv(out, index=False, lineterminator="\n")
+    composition = "; ".join(f"paraphrase {k}: {', '.join(v)}" for k, v in by_para.items())
+    md = write_markdown(table, paths.tables / "per_paraphrase.md",
+                        "Key metrics by scripted-turn paraphrase (every sample; sample i used paraphrase i)",
+                        _notes(df, s, paths, scope) + [
+                            f"per-model rows: models with more than one paraphrase ({', '.join(multi) or 'none'})",
+                            f"{POOLED} rows pool every model with rows in that paraphrase ({composition})",
+                            "each paraphrase is a separate slice; the bootstrap resamples items within it"])
+    written = [out, md]
+    written.append(_manifest(paths.tables / "per_paraphrase_manifest.json", df_loaded, s, paths, scope,
+                             [*written], per_paraphrase={"models_with_multiple_paraphrases": multi,
+                                                         "models_per_paraphrase": {str(k): v for k, v
+                                                                                   in by_para.items()},
+                                                         "metrics": list(PER_PARAPHRASE_METRICS)}))
+    return written
+
+
+def run_first_attempt(df_loaded: pd.DataFrame, s: Settings, paths: Paths) -> list[Path]:
+    """results/tables/hypotheses_first_attempt.csv (+ .md, + manifest): primary samples,
+    exclusions applied, only cells whose arms in METRIC_ARMS all parsed on the first attempt."""
+    _, df, scope = apply_scope(df_loaded, s, all_samples=False, use_exclusions=True)
+    if df.empty:
+        raise ConfigError("no rows left after exclusions and the sample policy")
+    table = compute_hypotheses(add_row_metrics(df, s), s, scope, first_attempt=True)
+    paths.tables.mkdir(parents=True, exist_ok=True)
+    out = paths.tables / "hypotheses_first_attempt.csv"
+    table.to_csv(out, index=False, lineterminator="\n")
+    arm_notes = "; ".join(f"{m}: {', '.join(a)}" for m, a in METRIC_ARMS.items()
+                          if m in {h.metric for h in HYPOTHESES if h.hid in FIRST_ATTEMPT_HYPOTHESES})
+    md = write_markdown(table, paths.tables / "hypotheses_first_attempt.md",
+                        f"Hypotheses {', '.join(FIRST_ATTEMPT_HYPOTHESES)}: {FIRST_ATTEMPT_LABEL}",
+                        _notes(df, s, paths, scope) + [
+                            "a cell counts only if every arm entering the metric has status 'ok' (not "
+                            f"'reask_ok'); contrasts apply this to both conditions. Arms: {arm_notes}",
+                            _HYP_NOTE_VERDICT, _HYP_NOTE_HOLM])
+    written = [out, md]
+    written.append(_manifest(paths.tables / "hypotheses_first_attempt_manifest.json", df_loaded, s, paths, scope,
+                             [*written], restriction=FIRST_ATTEMPT_LABEL,
+                             metric_arms={m: list(a) for m, a in METRIC_ARMS.items()},
+                             hypotheses=list(FIRST_ATTEMPT_HYPOTHESES), **_holm_manifest()))
+    return written
+
+
+_HYP_NOTE_VERDICT = ("verdict: 'supported' if the CI excludes 0 in the predicted direction (!=0: either way); "
+                     "'opposite' if it excludes 0 the other way; else 'inconclusive'; NaN estimate: 'no data'")
+_HYP_NOTE_HOLM = ("p_boot: two-sided bootstrap p, 2 x min(share of resampled statistics <= 0, share >= 0), "
+                  f"floored at 1/n_boot; holm_p: Holm-adjusted over the family ({HOLM_FAMILY}); holm_verdict: "
+                  f"holm_p < {HOLM_ALPHA} with the sign of the estimate")
+
+
+def _holm_manifest() -> dict[str, Any]:
+    return {"multiple_comparisons": {"method": "Holm step-down", "family": HOLM_FAMILY, "alpha": HOLM_ALPHA,
+                                     "p_value": "two-sided bootstrap p over items, floored at 1/n_boot"}}
+
+
 def _sha256(path: Path) -> str:
     """Hash of the bytes on disk (kept for compatibility; depends on the checkout's line endings)."""
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -1443,6 +1725,16 @@ def _md_cell(v: Any) -> str:
     return str(v).replace("|", "\\|").replace("\n", " ")
 
 
+P_VALUE_COLUMNS: frozenset[str] = frozenset({"p_boot", "holm_p"})
+
+
+def _md_p_cell(v: Any) -> str:
+    """p-values to 4 decimals so the 1/n_boot floor (e.g. 0.0001) does not print as 0.000."""
+    if isinstance(v, (float, np.floating)) and not math.isnan(v):
+        return f"{v:.4f}"
+    return _md_cell(v)
+
+
 def write_markdown(table: pd.DataFrame, path: Path, title: str, notes: Sequence[str]) -> Path:
     """Plain Markdown copy of a generated table (floats to 3 decimals). Never edited by hand."""
     lines = [f"# {title}", "", "Generated by `python -m src.analyze`; do not edit by hand.", ""]
@@ -1450,8 +1742,10 @@ def write_markdown(table: pd.DataFrame, path: Path, title: str, notes: Sequence[
     cols = list(table.columns)
     lines.append("| " + " | ".join(cols) + " |")
     lines.append("|" + "|".join("---" for _ in cols) + "|")
+    p_cols = {k for k, c in enumerate(cols) if c in P_VALUE_COLUMNS}
     for row in table.itertuples(index=False):
-        lines.append("| " + " | ".join(_md_cell(v) for v in row) + " |")
+        lines.append("| " + " | ".join(_md_p_cell(v) if k in p_cols else _md_cell(v)
+                                       for k, v in enumerate(row)) + " |")
     if table.empty:
         lines += ["", "(no rows: no data)"]
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -1555,7 +1849,7 @@ def run_metrics(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_sampl
     written += write_per_tier(per_tier_table(metrics, scope), df, s, paths, scope)
 
     if figures:
-        title_note = f"samples={scope.samples}"
+        title_note = plain_samples(scope.samples)
         plot_summary(metrics, POOLED, subjects, conditions, paths.figures / "summary_ALL_MODELS.png",
                      banner, s.ci, title_note)
         written.append(paths.figures / "summary_ALL_MODELS.png")
@@ -1594,9 +1888,7 @@ def run_hypotheses(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_sa
     table.to_csv(out, index=False, lineterminator="\n")
     md = write_markdown(table, paths.tables / "hypotheses.md", "Hypotheses H1-H6",
                         _notes(df, s, paths, scope) + [
-                            "verdict: 'supported' if the CI excludes 0 in the predicted direction (!=0: either "
-                            "way); 'opposite' if it excludes 0 the other way; else 'inconclusive'; "
-                            "NaN estimate: 'no data'",
+                            _HYP_NOTE_VERDICT, _HYP_NOTE_HOLM,
                             "contrasts (comparison 'X - default') are paired by item within model"])
     written = [out, md]
     if figures:
@@ -1604,9 +1896,9 @@ def run_hypotheses(df_loaded: pd.DataFrame, s: Settings, paths: Paths, *, all_sa
         plot_forest(table, forest, DRY_BANNER if paths.dry_run else "", s.ci)
         written.append(forest)
     written.append(_manifest(paths.tables / "hypotheses_manifest.json", df_loaded, s, paths, scope, written,
-                             **(manifest_extra or {})))
+                             **_holm_manifest(), **(manifest_extra or {})))
     print(table[["hypothesis", "subject", "comparison", "metric", "estimate", "ci_low", "ci_high", "n_items",
-                 "verdict"]].to_string(index=False))
+                 "verdict", "p_boot", "holm_p", "holm_verdict"]].to_string(index=False))
     return written
 
 
@@ -1680,6 +1972,9 @@ def run_all(cfg: HarnessConfig, s: Settings, paths: Paths, *, cross: bool = Fals
             ("metrics (tables, per-tier, summary figures)", lambda: run_metrics(loaded, s, paths, cross=cross)),
             ("hypotheses (table, forest figure)", lambda: run_hypotheses(loaded, s, paths)),
             ("robustness", lambda: run_robustness(loaded, s, paths)),
+            ("per-paraphrase (every sample, by scripted-turn paraphrase)",
+             lambda: run_per_paraphrase(loaded, s, paths)),
+            ("first-attempt (hypotheses on first-attempt parses only)", lambda: run_first_attempt(loaded, s, paths)),
         ]
 
     waiting = validation_inputs(cfg, paths, annotator)
@@ -1711,8 +2006,8 @@ def run_all(cfg: HarnessConfig, s: Settings, paths: Paths, *, cross: bool = Fals
 # CLI
 # ---------------------------------------------------------------------------
 
-COMMANDS = ("metrics", "hypotheses", "robustness", "per-tier", "all", "annotation-agreement",
-            "export-human-sheet", "human-agreement")
+COMMANDS = ("metrics", "hypotheses", "robustness", "per-tier", "per-paraphrase", "first-attempt", "all",
+            "annotation-agreement", "export-human-sheet", "human-agreement")
 SCOPED_COMMANDS: tuple[str, ...] = ("metrics", "hypotheses", "per-tier")
 
 
@@ -1743,8 +2038,8 @@ def main(argv: list[str] | None = None) -> int:
             raise ConfigError("--all-samples applies to `metrics`, `hypotheses` and `per-tier` only; exported "
                               "samples always use analysis.primary_samples, and `robustness`/`all` set the "
                               "scope themselves")
-        if args.no_exclusions and args.command in ("robustness", "all"):
-            raise ConfigError("`robustness` and `all` set the scope themselves; --no-exclusions does not apply")
+        if args.no_exclusions and args.command in ("robustness", "all", "per-paraphrase", "first-attempt"):
+            raise ConfigError(f"`{args.command}` sets the scope itself; --no-exclusions does not apply")
         if paths.dry_run:
             print(f"== {DRY_BANNER}")
         if args.command == "all":
@@ -1778,6 +2073,10 @@ def main(argv: list[str] | None = None) -> int:
                                        use_exclusions=not args.no_exclusions)
             elif args.command == "robustness":
                 written = run_robustness(df, s, paths)
+            elif args.command == "per-paraphrase":
+                written = run_per_paraphrase(df, s, paths)
+            elif args.command == "first-attempt":
+                written = run_first_attempt(df, s, paths)
             else:  # export-human-sheet
                 df_excl, _, _ = apply_scope(df, s, all_samples=False, use_exclusions=not args.no_exclusions)
                 written = export_human_sheet(df_excl, load_judge_briefings(paths.log), s, paths, args.force)
