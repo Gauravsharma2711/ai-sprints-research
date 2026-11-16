@@ -20,7 +20,7 @@ def make_draft(abstract: str = "", *, authors: bool = False, limitations: str = 
                related: bool = True, ai_use: str | None = None, main_extra: str = "") -> str:
     ai = ai_use if ai_use is not None else (
         f"Claude (Claude Code, Anthropic) wrote the code. The judge was {JUDGE}. "
-        "The author reviewed the items and confirmed the citations."
+        "The author directed the project and is responsible for all content."
     )
     parts = [
         "<!-- a comment with {{num:x}} and causal scrubbing -->",
@@ -100,7 +100,7 @@ def test_structure_complete_passes() -> None:
 
 
 def test_structure_accepts_judge_placeholder() -> None:
-    ai = "Claude drafted it. Judge {{cfg:judge.model:s}}. The author rated briefings."
+    ai = "Claude drafted it. Judge {{cfg:judge.model:s}}. The author ran all model runs."
     assert g.check_structure(make_draft(ai_use=ai), JUDGE)[0] == "PASS"
 
 
@@ -110,7 +110,7 @@ def test_structure_reports_missing_parts() -> None:
     assert status == "FAIL"
     assert "Related Work" in detail
     assert g.LIMITATIONS_HEADING in detail
-    assert "Claude" in detail and JUDGE in detail and "reviewed" in detail
+    assert "Claude" in detail and JUDGE in detail and "author did" in detail
 
 
 def test_structure_limitations_with_appendix_prefix() -> None:

@@ -249,8 +249,11 @@ def check_structure(text: str, judge_model: str | None) -> GateResult:
             missing.append("judge.model not set in config.yaml")
         elif judge_model not in body and "{{cfg:judge.model" not in body:
             missing.append(f"AI-use statement: judge model id '{judge_model}'")
-        if not re.search(r"\bauthors?\b[^.]*\b(review|rate|rated|rating|confirm)", body, re.IGNORECASE):
-            missing.append("AI-use statement: that the author reviewed/rated/confirmed")
+        # The statement must say what the author did (their role), without forcing a claim of a
+        # review that may not have happened: "directed", "responsible", "ran", "reviewed", ...
+        role = r"\bauthors?\b[^.]*\b(direct\w*|responsib\w*|ran|run|design\w*|review\w*|rated|confirm\w*)"
+        if not re.search(role, body, re.IGNORECASE):
+            missing.append("AI-use statement: what the author did (their role)")
     if missing:
         return "FAIL", "missing: " + "; ".join(missing)
     return "PASS", f"{len(DRAFT_HEADINGS) + 1} required headings and AI-use statement present"
