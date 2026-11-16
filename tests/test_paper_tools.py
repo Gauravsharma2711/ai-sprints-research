@@ -118,16 +118,29 @@ def synthetic_tables(root: Path) -> tuple[Path, Path]:
                 rows.append([subject, cond, sample, n, n, n if sample == 0 else 0])
     write_csv(tables / "coverage.csv", ["subject", "condition", "sample", "n_items", "n_cells", "n_judged"], rows)
     hyp_header = ["hypothesis", "description", "subject", "comparison", "metric", "tier", "predicted_sign",
-                  "estimate", "ci_low", "ci_high", "n_items", "n_cells", "verdict", "samples", "exclusions"]
+                  "estimate", "ci_low", "ci_high", "n_items", "n_cells", "verdict", "samples", "exclusions",
+                  "p_boot", "holm_p", "holm_verdict"]
 
     def hypotheses() -> list[list[object]]:
         return [[h, f"synthetic {h}", subject, comp, metric, tier, ">0", *est(), 60, 180, "supported", "0",
-                 "applied (0 items)"] for h, comp, metric, tier in HYPOTHESES for subject in (*SUBJECTS, "ALL_MODELS")]
+                 "applied (0 items)", *((0.01, 0.04, "supported") if subject == "ALL_MODELS" else ("", "", ""))]
+                for h, comp, metric, tier in HYPOTHESES for subject in (*SUBJECTS, "ALL_MODELS")]
     write_csv(tables / "hypotheses.csv", hyp_header, hypotheses())
+    write_csv(tables / "hypotheses_first_attempt.csv", [*hyp_header, "restriction"],
+              [[*row, "first_attempt_only"] for row in hypotheses()])
+    write_csv(tables / "per_paraphrase.csv",
+              ["subject", "condition", "paraphrase_idx", "metric", "estimate", "ci_low", "ci_high", "n_items",
+               "n_cells", "exclusions"],
+              [[subject, cond, k, metric, *est(), 60, 60, "applied (0 items)"]
+               for subject in (*SUBJECTS, "ALL_MODELS") for cond in CONDITIONS
+               for k in ((0,) if subject == "mistral-7b" else (0, 1, 2))
+               for metric in ("bluff_shift", "net_bluff_shift")])
     write_csv(tables / "per_tier.csv",
               ["subject", "condition", "metric", "tier", "estimate", "ci_low", "ci_high", "n_items", "n_cells",
                "samples", "exclusions"],
-              [[subject, cond, metric, tier, *est(), 20, 60, "0", "applied (0 items)"]
+              [[subject, cond, metric, tier,
+                *(["", "", ""] if (metric.startswith("brier") and tier == "2") else est()), 20, 60, "0",
+                "applied (0 items)"]
                for subject in (*SUBJECTS, "ALL_MODELS") for cond in CONDITIONS for metric in METRICS
                for tier in TIERS[1:]])
     for variant in ("all_samples", "no_exclusions"):
@@ -164,8 +177,19 @@ def make_ctx(tables: Path, figures: Path, out: Path, draft_dir: Path, **kw: bool
                            out_dir=out, **kw)
 
 
+REFS_MD = """# References
+
+- [smith2024] Smith, J. (2024). A Single-Author Paper. arXiv:2401.00001. UNCONFIRMED - user must check.
+- [ab2025] Ab, C., & Cd, E. (2025). Two Authors, pp. 11-22. CONFIRMED by user 2026-11-16.
+- [many2023] Zed, A., Young, B., & Xu, C. (2023). Three Authors. CONFIRMED.
+- [etal2026] Abel, M., Baker, N., et al. (2026). Truncated Author List. UNCONFIRMED - user must check.
+- [unused2020] Never, C. (2020). Not Cited. CONFIRMED.
+"""
+
+
 def build_text(tmp_path: Path, draft: str, **kw: bool) -> tuple[bp.BuildContext, list[str], Path]:
     tables, figures = small_tables(tmp_path / "in")
+    (tmp_path / "references.md").write_text(REFS_MD, encoding="utf-8")
     out = tmp_path / "out"
     d = tmp_path / "draft.md"
     d.write_text(draft, encoding="utf-8")
@@ -320,11 +344,69 @@ def test_html_comments_dropped_and_include(tmp_path: Path) -> None:
 
 def test_final_flag_rejects_editorial_markers(tmp_path: Path) -> None:
     tables, figures = small_tables(tmp_path / "in")
+    (tmp_path / "references.md").write_text(REFS_MD, encoding="utf-8")
     draft = tmp_path / "d.md"
-    draft.write_text("As shown [CITE:someone]. [RESULT PROSE - after freeze]\n", encoding="utf-8")
+    draft.write_text("As shown [CITE:smith2024]. [RESULT PROSE - after freeze]\n", encoding="utf-8")
     assert bp.build(make_ctx(tables, figures, tmp_path / "o", tmp_path), draft) == []
     errors = bp.build(make_ctx(tables, figures, tmp_path / "o", tmp_path), draft, final=True)
     assert len(errors) == 2
+    assert any("unfinished marker [CITE:smith2024] (--final)" in e for e in errors)
+
+
+def test_citations_render_author_year(tmp_path: Path) -> None:
+    draft = ("One [CITE:smith2024]. Two [CITE:ab2025]. Three [CITE:many2023]. "
+             "Many [CITE:etal2026, smith2024].\n")
+    ctx, errors, out = build_text(tmp_path, draft)
+    assert errors == []
+    text = (out / "paper.md").read_text(encoding="utf-8")
+    assert "One (Smith, 2024)." in text
+    assert "Two (Ab & Cd, 2025)." in text
+    assert "Three (Zed et al., 2023)." in text
+    assert "Many (Abel et al., 2026; Smith, 2024)." in text
+    assert "[CITE:" not in text
+
+
+def test_citation_with_missing_entry_fails(tmp_path: Path) -> None:
+    ctx, errors, out = build_text(tmp_path, "See [CITE:smith2024,nobody2030].\n")
+    assert any("nobody2030" in e for e in errors)
+    assert not (out / "paper.md").exists()
+
+
+def test_refs_placeholder_lists_cited_entries_sorted(tmp_path: Path) -> None:
+    draft = "A [CITE:smith2024] and [CITE:ab2025,many2023].\n\n## References\n\n{{refs}}\n"
+    ctx, errors, out = build_text(tmp_path, draft)
+    assert errors == []
+    text = (out / "paper.md").read_text(encoding="utf-8")
+    refs = text.split("## References", 1)[1].strip().splitlines()
+    assert refs == ["- Ab, C., & Cd, E. (2025). Two Authors, pp. 11-22. CONFIRMED by user 2026-11-16.",
+                    "- Smith, J. (2024). A Single-Author Paper. arXiv:2401.00001. UNCONFIRMED - user must check.",
+                    "- Zed, A., Young, B., & Xu, C. (2023). Three Authors. CONFIRMED."]
+    assert "Never" not in text  # uncited entries are not listed
+    # numbers inside entries are traced to references.md, so the audit passes
+    code = na.main([str(out / "paper.md"), "--numbers-used", str(out / "numbers_used.csv"), "--config", str(CONFIG)])
+    assert code == 0
+
+
+def test_final_renders_confirmed_citations_only(tmp_path: Path) -> None:
+    tables, figures = small_tables(tmp_path / "in")
+    (tmp_path / "references.md").write_text(REFS_MD, encoding="utf-8")
+    draft = tmp_path / "d.md"
+    draft.write_text("Ok [CITE:ab2025,many2023]. Bad [CITE:ab2025,smith2024].\n\n{{refs}}\n", encoding="utf-8")
+    errors = bp.build(make_ctx(tables, figures, tmp_path / "o", tmp_path), draft, final=True)
+    assert len(errors) == 1 and "[CITE:ab2025,smith2024]" in errors[0]
+    draft.write_text("Ok [CITE:ab2025,many2023].\n\n{{refs}}\n", encoding="utf-8")
+    assert bp.build(make_ctx(tables, figures, tmp_path / "o", tmp_path), draft, final=True) == []
+    assert "Ok (Ab & Cd, 2025; Zed et al., 2023)." in (tmp_path / "o" / "paper.md").read_text(encoding="utf-8")
+
+
+def test_missing_text_format_suffix(tmp_path: Path) -> None:
+    draft = ("{{num:metrics:subject=ALL_MODELS;condition=stand_firm;metric=evidence_update:ci_low:.2f?\u2013}}\n\n"
+             "{{pivot:metrics:subject=ALL_MODELS;metric=evidence_update:metric:condition:estimate+ci:.2f?\u2013}}\n")
+    ctx, errors, out = build_text(tmp_path, draft)
+    assert errors == [] and not ctx.warnings
+    text = (out / "paper.md").read_text(encoding="utf-8")
+    assert text.startswith("\u2013\n")
+    assert "| evidence_update | 0.31 [0.25, 0.37] | 0.21 [\u2013, \u2013] |" in text
 
 
 def test_docx_created_and_opens(tmp_path: Path) -> None:
@@ -469,6 +551,8 @@ def test_real_draft_builds_on_synthetic_tables_and_passes_audit(tmp_path: Path) 
     Document(str(out / "paper.docx"))
     code = na.main([str(out / "paper.md"), "--numbers-used", str(out / "numbers_used.csv"), "--config", str(CONFIG)])
     assert code == 0
+    assert "## References" in text and "(Shnaidman, 2026)" in text and "[CITE:" not in text
+    assert "| brier_T1 | " in text and "| \u2013 |" in text  # tier-2 Brier rendered as a dash
     assert bp.build(make_ctx(tables, figures, out, DRAFT.parent), DRAFT, final=True)  # markers remain
 
 
