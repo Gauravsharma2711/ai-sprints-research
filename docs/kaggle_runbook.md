@@ -9,13 +9,12 @@ token is needed.
 |---|---|
 | `HF_TOKEN` | Hugging Face token, type Read (accept each gated model's terms on HF first, e.g. Mistral) |
 | `GEMINI_API_KEY` | Gemini API key from Google AI Studio: the judge |
-| `GROQ_API_KEY` | optional: only for the second judge later |
 
 **How judging works now.** The GPU run (Cell 10) does every subject arm and saves the judge arm as
 `pending`. A separate judge pass (Cell 11) then scores every pending cell with Gemini. It needs no
 GPU, paces itself under Gemini's limits, stops cleanly at the daily limit, and can be resumed later
 on Kaggle or on your own computer. It also re-judges any cell that was scored by a different judge
-model (e.g. earlier gpt-oss scores), so every J comes from the same judge.
+model, so every J comes from the same Gemini model.
 
 **Before the first session, fill in the judge block in Cell 1** from Google AI Studio:
 `JUDGE_MODEL` (exact model id), the two prices (0.0 if you use the free tier), and the three rate
@@ -43,12 +42,11 @@ START = time.time()
 # ---- the only lines you normally edit ----
 MODEL = "qwen2.5-7b"          # llama-3.1-8b | qwen2.5-7b | mistral-7b | phi-3.5-mini
 LIMIT = 3                     # smoke-test items
-ALLOW_UNVERIFIED = True       # set False once both annotators have reviewed the benchmark
+ALLOW_UNVERIFIED = True       # the benchmark items are not human-verified; the harness needs this flag to run them
 VLLM_SPEC = "vllm"            # if the vLLM install fails once, change to "vllm==0.9.2"
 PREV_DIR = "/kaggle/input/prev-results"   # earlier results_*.zip, uploaded as a dataset named prev-results
 
-# Judge (Google Gemini). Values from Google AI Studio for the model you pick.
-JUDGE_PROVIDER = "gemini"     # "gemini" (default) | "groq" | "xai"
+# Judge (Google Gemini, the only judge). Values from Google AI Studio for the model you pick.
 JUDGE_MODEL  = ""             # FILL IN: model id exactly as listed (Cell 7b prints the ids); this study used gemini-3.1-flash-lite
 JUDGE_FAMILY = "google"       # must differ from llama/qwen/mistral/phi (the harness checks)
 JUDGE_MAX_TOKENS = 300        # room for hidden reasoning; some Gemini models cannot turn it off
@@ -69,14 +67,10 @@ PER_MODEL = {   # mirrors config.yaml: (tensor_parallel, vLLM --quantization)
     "phi-3.5-mini": (1, None),
 }
 TP, QUANT = PER_MODEL[MODEL]
-JUDGE_BASE_URL, JUDGE_KEY = {
-    "gemini": ("https://generativelanguage.googleapis.com/v1beta/openai/", "GEMINI_API_KEY"),
-    "groq":   ("https://api.groq.com/openai/v1", "GROQ_API_KEY"),
-    "xai":    ("https://api.x.ai/v1", "XAI_API_KEY"),
-}[JUDGE_PROVIDER]
+JUDGE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"   # Gemini's OpenAI-compatible endpoint
+JUDGE_KEY = "GEMINI_API_KEY"
 UNV = "--allow-unverified" if ALLOW_UNVERIFIED else ""
-LORA_PATH, LORA_NAME = None, "contract_sft"   # unused in this study: keep None
-print("model:", MODEL, "| TP:", TP, "| quant:", QUANT, "| judge:", JUDGE_PROVIDER, JUDGE_MODEL or "(not set)")
+print("model:", MODEL, "| TP:", TP, "| quant:", QUANT, "| judge: gemini", JUDGE_MODEL or "(not set)")
 ```
 
 ## Cell 2: secrets, clone the repo, install requirements
@@ -92,12 +86,12 @@ def sh(cmd, timeout=None, show=True):
     return p.returncode
 
 sec = UserSecretsClient()
-for k in ["HF_TOKEN", "GEMINI_API_KEY", "GROQ_API_KEY", "XAI_API_KEY"]:
+for k in ["HF_TOKEN", JUDGE_KEY]:
     try:
         os.environ[k] = sec.get_secret(k)
         print(k, "loaded")                       # never prints the value
     except Exception:
-        print(k, "not attached" + (" - REQUIRED" if k in ("HF_TOKEN", JUDGE_KEY) else " (optional)"))
+        print(k, "not attached - REQUIRED")
 os.environ["HF_HOME"] = "/tmp/hf"
 
 if not os.path.isdir(REPO):
@@ -138,7 +132,7 @@ def apply_settings(c):
     s = next(x for x in c["subjects"] if x["name"] == MODEL)
     assert s["tensor_parallel"] == TP, (s["tensor_parallel"], TP)
     s["confirmed"] = True                      # you have checked the HF id, licence and T4 fit
-    c["judge"].update(provider=JUDGE_PROVIDER, model=JUDGE_MODEL or None, family=JUDGE_FAMILY,
+    c["judge"].update(provider="gemini", model=JUDGE_MODEL or None, family=JUDGE_FAMILY,
                       base_url=JUDGE_BASE_URL, api_key_env=JUDGE_KEY, max_tokens=JUDGE_MAX_TOKENS,
                       reasoning_effort=JUDGE_REASONING_EFFORT,
                       price_per_1m_input_usd=PRICE_IN_1M, price_per_1m_output_usd=PRICE_OUT_1M)
@@ -156,7 +150,7 @@ def judge_ready():
 
 cfg = _edit(apply_settings)
 HF_MODEL = next(x for x in cfg["subjects"] if x["name"] == MODEL)["hf_id"]
-print("will serve:", HF_MODEL, "| judge:", JUDGE_PROVIDER, JUDGE_MODEL or "(not set)",
+print("will serve:", HF_MODEL, "| judge: gemini", JUDGE_MODEL or "(not set)",
       "| cap: $", cfg["budget"]["max_spend_usd"])
 ```
 
@@ -201,8 +195,6 @@ cmd = ["/tmp/vllm-env/bin/vllm", "serve", HF_MODEL, "--dtype", "half", "--max-mo
        "--gpu-memory-utilization", "0.88", "--tensor-parallel-size", str(TP), "--port", "8000"]
 if QUANT:
     cmd += ["--quantization", QUANT]
-if LORA_PATH:
-    cmd += ["--enable-lora", "--lora-modules", f"{LORA_NAME}={LORA_PATH}", "--max-lora-rank", "64"]
 if TP == 1:
     env["CUDA_VISIBLE_DEVICES"] = "0"
 
@@ -228,7 +220,7 @@ if not ready:
 from openai import OpenAI
 # a) local logprobs (free)
 local = OpenAI(base_url="http://localhost:8000/v1", api_key="EMPTY")
-r = local.chat.completions.create(model=LORA_NAME if LORA_PATH else HF_MODEL,
+r = local.chat.completions.create(model=HF_MODEL,
     messages=[{"role": "user", "content": "Answer with one word, Yes or No: Is the sky blue on a clear day?"}],
     max_tokens=1, temperature=0, logprobs=True, top_logprobs=5)
 print("logprobs:", [(t.token, round(t.logprob, 3)) for t in r.choices[0].logprobs.content[0].top_logprobs])
@@ -331,7 +323,7 @@ across all models in `results.csv`). If the worst case is above $0 and you appro
 ```python
 import pandas as pd
 server.terminate()
-tag = MODEL + ("_lora" if LORA_PATH else "")
+tag = MODEL
 shutil.copy("/kaggle/working/vllm_server.log", f"{REPO}/results/raw/vllm_server_{tag}.log")
 shutil.make_archive(f"/kaggle/working/results_{tag}", "zip", f"{REPO}/results/raw")
 

@@ -6,8 +6,8 @@ Test-only substitutions (everything else runs exactly as written in the runbook)
   torch                            -> stub (no GPU here)
   Cell 5 (vLLM install)            -> skipped
   vllm serve                       -> fake_openai.py serving the same model id on :8000
-  xAI judge                        -> fake_openai.py on :8001 (config judge.base_url patched)
-  JUDGE_MODEL / prices             -> fake-judge, 1.0, 2.0
+  Gemini judge endpoint            -> fake_openai.py on :8001 (config judge.base_url patched)
+  JUDGE_MODEL / prices             -> fake-judge, 0.0, 0.0
 usage: python tools/kaggle_sim/run_sim.py docs/kaggle_runbook.md <empty temp dir> first|resume|second_model|smoke
 (resume/second_model expect <dir>/input/prev-results/ to hold an unzipped results_*.zip; needs ipython)
 """
@@ -58,9 +58,7 @@ def subst(code: str) -> str:
     code = re.sub(r'^JUDGE_MODEL  = .*$', 'JUDGE_MODEL  = "fake-judge"', code, flags=re.M)
     code = code.replace("PRICE_IN_1M  = None", "PRICE_IN_1M  = 0.0").replace("PRICE_OUT_1M = None", "PRICE_OUT_1M = 0.0")
     code = code.replace('"/tmp/vllm-env/bin/vllm", "serve", HF_MODEL,', f'sys.executable, "{FAKE}", HF_MODEL,')
-    for url in ("https://api.x.ai/v1", "https://api.groq.com/openai/v1",
-                "https://generativelanguage.googleapis.com/v1beta/openai/"):
-        code = code.replace(url, "http://127.0.0.1:8001/v1")
+    code = code.replace("https://generativelanguage.googleapis.com/v1beta/openai/", "http://127.0.0.1:8001/v1")
     if session == "second_model":
         code = code.replace('MODEL = "qwen2.5-7b"', 'MODEL = "phi-3.5-mini"')
     return code
