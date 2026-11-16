@@ -36,8 +36,6 @@ HYPOTHESES = (  # (id, description, comparison, metric, tier, predicted sign)
     ("H6", "contract selectivity", "contract_prompt - default", "selectivity", "all", ">0"),
     ("H6", "contract hysteresis", "contract_prompt - default", "excess_hysteresis_abs", "all", "<0"),
 )
-# Paths the README may link to before they exist on this branch (added by parallel workstreams).
-ADDED_IN_PARALLEL = {"results/figures/hypotheses_forest.png", "tools/gates.py"}
 STALE = ("Not started", "dry-run only", "to be written", "_None yet", "Not yet run on Kaggle")
 
 
@@ -76,6 +74,13 @@ def synthetic(root: Path) -> tuple[Path, Path]:
             for sample in (0, 1):
                 cov.append([subject, cond, sample, 7, 7, 7 if sample == 0 else 0])
     write_csv(tables / "coverage.csv", ["subject", "condition", "sample", "n_items", "n_cells", "n_judged"], cov)
+    met: list[list[object]] = []
+    for subject in (*SUBJECTS, "ALL_MODELS"):
+        for cond in CONDITIONS:
+            e = round(rng.uniform(-0.3, 0.3), 6)
+            met.append(["real", subject, cond, "all", "selectivity", e, e - 0.05, e + 0.05, 20])
+    write_csv(tables / "metrics.csv",
+              ["data_source", "subject", "condition", "tier", "metric", "estimate", "ci_low", "ci_high", "n_items"], met)
     tiny_png(figures / "summary_ALL_MODELS.png")
     return tables, figures
 
@@ -173,8 +178,69 @@ def test_committed_readme_links_and_stale_strings() -> None:
         if re.match(r"^[a-z]+://", t) or t.startswith("#"):
             continue
         path = t.split("#", 1)[0]
-        if path in ADDED_IN_PARALLEL:
-            continue
         if not (REPO / path).exists():
             missing.append(t)
     assert not missing, f"README links that do not resolve: {missing}"
+
+
+def _set_selectivity_ci(tables: Path, lo: str, hi: str) -> None:
+    path = tables / "metrics.csv"
+    rows = list(csv.reader(path.open(encoding="utf-8", newline="")))
+    for r in rows[1:]:
+        if r[1] == "ALL_MODELS" and r[2] == "default":
+            r[6], r[7] = lo, hi
+    write_csv(path, rows[0], rows[1:])
+
+
+@pytest.mark.parametrize(("lo", "hi", "phrase"), [
+    ("-0.01", "0.2", "inconclusive (CI includes 0)"),
+    ("0.01", "0.2", "CI excludes 0, positive"),
+    ("-0.2", "-0.01", "CI excludes 0, negative"),
+])
+def test_ci_zero_phrase(tmp_path: Path, lo: str, hi: str, phrase: str) -> None:
+    tables, figures = synthetic(tmp_path / "src")
+    _set_selectivity_ci(tables, lo, hi)
+    tpl = tmp_path / "t.md"
+    tpl.write_text("<!-- BEGIN GENERATED: s -->\n"
+                   "{{readme:ci_zero:metrics:subject=ALL_MODELS;condition=default;tier=all;metric=selectivity}}\n"
+                   "<!-- END GENERATED: s -->\n", encoding="utf-8")
+    assert run(tmp_path, tables, figures, template=tpl) == 0
+    assert phrase in (tmp_path / "README.md").read_text(encoding="utf-8")
+
+
+def test_ci_zero_missing_row_or_nan_is_an_error(tmp_path: Path) -> None:
+    tables, figures = synthetic(tmp_path / "src")
+    tpl = tmp_path / "t.md"
+    tpl.write_text("<!-- BEGIN GENERATED: s -->\n{{readme:ci_zero:metrics:subject=nobody}}\n"
+                   "<!-- END GENERATED: s -->\n", encoding="utf-8")
+    assert run(tmp_path, tables, figures, template=tpl) == 1
+    _set_selectivity_ci(tables, "nan", "0.1")
+    tpl.write_text("<!-- BEGIN GENERATED: s -->\n"
+                   "{{readme:ci_zero:metrics:subject=ALL_MODELS;condition=default;tier=all;metric=selectivity}}\n"
+                   "<!-- END GENERATED: s -->\n", encoding="utf-8")
+    assert run(tmp_path, tables, figures, template=tpl) == 1
+    assert not (tmp_path / "README.md").exists()
+
+
+BANNED_JUDGE_WORDS = re.compile(r"groq|gpt-oss|\bxai\b|x\.ai|grok|second judge|second_judge|adaption",
+                                re.IGNORECASE)
+
+
+@pytest.mark.parametrize("rel", ["README.template.md", "README.md", "docs/kaggle_runbook.md",
+                                 "tools/kaggle_sim/run_sim.py", "tools/kaggle_sim/fake_openai.py"])
+def test_gemini_is_the_only_judge(rel: str) -> None:
+    text = (REPO / rel).read_text(encoding="utf-8")
+    hits = sorted({m.group(0) for m in BANNED_JUDGE_WORDS.finditer(text)})
+    assert not hits, f"{rel} mentions {hits}"
+
+
+def test_license_citation_and_ai_use() -> None:
+    assert "Copyright (c) 2026 Gaurav Sharma" in (REPO / "LICENSE").read_text(encoding="utf-8")
+    cff = (REPO / "CITATION.cff").read_text(encoding="utf-8")
+    assert "cff-version: 1.2.0" in cff and "family-names: Sharma" in cff and "license: MIT" in cff
+    assert br.paper_title(DRAFT) in cff
+    text = (REPO / "README.md").read_text(encoding="utf-8")
+    assert "author       = {Gaurav Sharma}" in text and "](LICENSE)" in text
+    assert "The benchmark labels have not been independently verified by a human." in text
+    for claim in ("reviewed the items", "rated briefings", "confirmed the citations", "being added in parallel"):
+        assert claim not in text, claim

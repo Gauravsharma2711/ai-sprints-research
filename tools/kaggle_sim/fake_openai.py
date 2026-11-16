@@ -1,4 +1,4 @@
-"""Fake OpenAI-compatible server (stand-in for vLLM or xAI) for testing the runbook locally.
+"""Fake OpenAI-compatible server (stand-in for vLLM or the Gemini judge endpoint) for testing the runbook locally.
 
 usage: python fake_openai.py <served-model-id> [--port N] [any vLLM flags, ignored]
 Replies are placeholders, never results.
